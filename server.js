@@ -330,6 +330,10 @@ app.post("/send-notification", verifyUser, async (req, res) => {
 
 const port = process.env.PORT || 3000;
 
-app.listen(port, () => {
-  console.log(`MONO notification server running on port ${port}`);
-});
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`MONO notification server running on port ${port}`);
+  });
+}
+
+module.exports = app;
