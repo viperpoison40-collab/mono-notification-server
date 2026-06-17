@@ -8,6 +8,7 @@ const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
 const serviceAccount = process.env.FIREBASE_PRIVATE_KEY
   ? {
       projectId: process.env.FIREBASE_PROJECT_ID,
@@ -19,10 +20,32 @@ const serviceAccount = process.env.FIREBASE_PRIVATE_KEY
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
+
 const db = admin.firestore();
 
 function cleanText(value) {
   return String(value ?? "").trim();
+}
+
+function shortText(value, max = 120) {
+  const text = cleanText(value);
+  if (!text) return "";
+  return text.length > max ? `${text.substring(0, max)}...` : text;
+}
+
+function safeData(data = {}) {
+  const output = {};
+
+  Object.entries(data).forEach(([key, value]) => {
+    const cleanKey = cleanText(key);
+    const cleanValue = cleanText(value);
+
+    if (cleanKey && cleanValue) {
+      output[cleanKey] = cleanValue;
+    }
+  });
+
+  return output;
 }
 
 async function verifyUser(req, res, next) {
@@ -33,14 +56,20 @@ async function verifyUser(req, res, next) {
       : "";
 
     if (!token) {
-      return res.status(401).json({ ok: false, error: "Missing Firebase ID token" });
+      return res.status(401).json({
+        ok: false,
+        error: "Missing Firebase ID token",
+      });
     }
 
     const decoded = await admin.auth().verifyIdToken(token);
     req.user = decoded;
     return next();
   } catch (error) {
-    return res.status(401).json({ ok: false, error: "Invalid Firebase ID token" });
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid Firebase ID token",
+    });
   }
 }
 
@@ -55,7 +84,7 @@ async function getUserTitle(uid) {
     if (displayName) return displayName;
 
     const username = cleanText(data.username);
-    if (username) return username;
+    if (username) return `@${username}`;
   } catch (error) {
     console.warn("Failed to read user title", uid, error.message);
   }
@@ -101,7 +130,14 @@ async function deleteBadTokens(uid, badTokens) {
   await batch.commit();
 }
 
-async function sendPushToUser({ uid, title, body, data = {} }) {
+async function sendPushToUser({
+  uid,
+  title,
+  body,
+  data = {},
+  collapseKey = "mono_general",
+  tag = "mono_general",
+}) {
   const tokens = await getUserTokens(uid);
 
   if (tokens.length === 0) {
@@ -113,21 +149,30 @@ async function sendPushToUser({ uid, title, body, data = {} }) {
     };
   }
 
+  const cleanData = safeData({
+    ...data,
+    title,
+    body,
+  });
+
   const response = await admin.messaging().sendEachForMulticast({
     tokens,
     notification: {
       title,
       body,
     },
-    data,
+    data: cleanData,
     android: {
       priority: "high",
+      collapseKey,
       notification: {
         channelId: "mono_default_channel",
         sound: "default",
         priority: "high",
         defaultSound: true,
         defaultVibrateTimings: true,
+        tag,
+        clickAction: "FLUTTER_NOTIFICATION_CLICK",
       },
     },
   });
@@ -200,12 +245,14 @@ app.post("/send-message", verifyUser, async (req, res) => {
     }
 
     const senderName = await getUserTitle(senderUid);
-    const shortText = text.length > 120 ? `${text.substring(0, 120)}...` : text;
+    const messagePreview = shortText(text, 100);
 
     const result = await sendPushToUser({
       uid: toUid,
-      title: `رسالة جديدة من ${senderName}`,
-      body: shortText || "أرسل لك رسالة",
+      title: senderName,
+      body: messagePreview || "أرسل لك رسالة جديدة",
+      collapseKey: `chat_${convoId}`,
+      tag: `chat_${convoId}`,
       data: {
         type: "message",
         convoId,
@@ -219,7 +266,10 @@ app.post("/send-message", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-message error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -251,6 +301,8 @@ app.post("/send-call", verifyUser, async (req, res) => {
       uid: receiverUid,
       title: callType === "video" ? "مكالمة فيديو واردة" : "مكالمة صوتية واردة",
       body: `${callerName} يتصل بك الآن`,
+      collapseKey: `call_${callId}`,
+      tag: `call_${callId}`,
       data: {
         type: "call",
         callId,
@@ -264,7 +316,10 @@ app.post("/send-call", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-call error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -276,6 +331,9 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     const notificationId = cleanText(req.body.notificationId);
     const notificationType = cleanText(req.body.notificationType);
     const fallbackText = cleanText(req.body.text);
+
+    const postId = cleanText(req.body.postId);
+    const commentId = cleanText(req.body.commentId);
 
     if (!toUid) {
       return res.status(400).json({
@@ -293,30 +351,54 @@ app.post("/send-notification", verifyUser, async (req, res) => {
 
     const fromName = await getUserTitle(fromUid);
 
+    let type = "notification";
     let title = "إشعار جديد";
     let body = fallbackText || "لديك إشعار جديد";
+    let collapseKey = "mono_general";
+    let tag = notificationId ? `notification_${notificationId}` : "mono_general";
 
     if (notificationType === "like") {
+      type = "like";
       title = "إعجاب جديد";
       body = `${fromName} أعجب بمنشورك`;
+      collapseKey = postId ? `post_${postId}` : "mono_like";
+      tag = postId ? `post_${postId}` : "mono_like";
     } else if (notificationType === "comment") {
+      type = "comment";
       title = "تعليق جديد";
-      body = `${fromName} علّق على منشورك`;
+      body = fallbackText
+        ? `${fromName}: ${shortText(fallbackText, 90)}`
+        : `${fromName} علّق على منشورك`;
+      collapseKey = postId ? `post_${postId}` : "mono_comment";
+      tag = postId ? `post_${postId}` : "mono_comment";
+    } else if (notificationType === "comment_like") {
+      type = "comment_like";
+      title = "إعجاب بتعليقك";
+      body = `${fromName} أعجب بتعليقك`;
+      collapseKey = postId ? `post_${postId}` : "mono_comment_like";
+      tag = postId ? `post_${postId}` : "mono_comment_like";
     } else if (notificationType === "follow") {
+      type = "follow";
       title = "متابع جديد";
       body = `${fromName} بدأ بمتابعتك`;
+      collapseKey = `user_${fromUid}`;
+      tag = `user_${fromUid}`;
     }
 
     const result = await sendPushToUser({
       uid: toUid,
       title,
       body,
+      collapseKey,
+      tag,
       data: {
-        type: "notification",
+        type,
         notificationId,
+        notificationType,
+        postId,
+        commentId,
         fromUid,
         toUid,
-        notificationType,
         click_action: "FLUTTER_NOTIFICATION_CLICK",
       },
     });
@@ -324,7 +406,10 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-notification error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
