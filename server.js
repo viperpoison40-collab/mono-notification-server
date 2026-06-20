@@ -130,6 +130,33 @@ async function deleteBadTokens(uid, badTokens) {
   await batch.commit();
 }
 
+function collectBadTokens(response, tokens, uid) {
+  const badTokens = [];
+
+  response.responses.forEach((result, index) => {
+    if (result.success) return;
+
+    const code = result.error?.code || "";
+
+    if (
+      code.includes("registration-token-not-registered") ||
+      code.includes("invalid-registration-token") ||
+      code.includes("invalid-argument")
+    ) {
+      badTokens.push(tokens[index]);
+    }
+
+    console.warn("FCM send failed", {
+      uid,
+      index,
+      code,
+      message: result.error?.message,
+    });
+  });
+
+  return badTokens;
+}
+
 async function sendPushToUser({
   uid,
   title,
@@ -177,29 +204,58 @@ async function sendPushToUser({
     },
   });
 
-  const badTokens = [];
+  const badTokens = collectBadTokens(response, tokens, uid);
+  await deleteBadTokens(uid, badTokens);
 
-  response.responses.forEach((result, index) => {
-    if (result.success) return;
+  return {
+    ok: true,
+    sent: response.successCount,
+    failed: response.failureCount,
+    deletedBadTokens: badTokens.length,
+  };
+}
 
-    const code = result.error?.code || "";
+// خاص بالمكالمات فقط:
+// Data-only push حتى لا يظهر إشعار FCM عادي بجانب شاشة الاتصال.
+async function sendDataOnlyPushToUser({
+  uid,
+  data = {},
+  collapseKey = "mono_data",
+}) {
+  const tokens = await getUserTokens(uid);
 
-    if (
-      code.includes("registration-token-not-registered") ||
-      code.includes("invalid-registration-token") ||
-      code.includes("invalid-argument")
-    ) {
-      badTokens.push(tokens[index]);
-    }
+  if (tokens.length === 0) {
+    return {
+      ok: true,
+      sent: 0,
+      failed: 0,
+      message: "No FCM tokens found for this user",
+    };
+  }
 
-    console.warn("FCM send failed", {
-      uid,
-      index,
-      code,
-      message: result.error?.message,
-    });
+  const cleanData = safeData(data);
+
+  const response = await admin.messaging().sendEachForMulticast({
+    tokens,
+    data: cleanData,
+    android: {
+      priority: "high",
+      collapseKey,
+      ttl: 45000,
+    },
+    apns: {
+      headers: {
+        "apns-priority": "10",
+      },
+      payload: {
+        aps: {
+          contentAvailable: true,
+        },
+      },
+    },
   });
 
+  const badTokens = collectBadTokens(response, tokens, uid);
   await deleteBadTokens(uid, badTokens);
 
   return {
@@ -296,19 +352,21 @@ app.post("/send-call", verifyUser, async (req, res) => {
     }
 
     const callerName = await getUserTitle(callerUid);
+    const title = callType === "video" ? "مكالمة فيديو واردة" : "مكالمة صوتية واردة";
+    const body = `${callerName} يتصل بك الآن`;
 
-    const result = await sendPushToUser({
+    const result = await sendDataOnlyPushToUser({
       uid: receiverUid,
-      title: callType === "video" ? "مكالمة فيديو واردة" : "مكالمة صوتية واردة",
-      body: `${callerName} يتصل بك الآن`,
       collapseKey: `call_${callId}`,
-      tag: `call_${callId}`,
       data: {
-        type: "call",
+        type: "incoming_call",
         callId,
         callerUid,
         receiverUid,
         callType,
+        callerName,
+        title,
+        body,
         click_action: "FLUTTER_NOTIFICATION_CLICK",
       },
     });
