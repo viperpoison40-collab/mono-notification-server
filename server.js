@@ -335,6 +335,7 @@ app.post("/send-call", verifyUser, async (req, res) => {
 
     const receiverUid = cleanText(req.body.receiverUid);
     const callId = cleanText(req.body.callId);
+    const conversationId = cleanText(req.body.conversationId || req.body.convoId);
     const callType = cleanText(req.body.callType) === "video" ? "video" : "voice";
 
     if (!receiverUid || !callId) {
@@ -351,9 +352,8 @@ app.post("/send-call", verifyUser, async (req, res) => {
       });
     }
 
-    const callerName = await getUserTitle(callerUid);
-    const title = callType === "video" ? "مكالمة فيديو واردة" : "مكالمة صوتية واردة";
-    const body = `${callerName} يتصل بك الآن`;
+    const fallbackCallerName = cleanText(req.body.callerName);
+    const callerName = fallbackCallerName || (await getUserTitle(callerUid));
 
     const result = await sendDataOnlyPushToUser({
       uid: receiverUid,
@@ -361,12 +361,14 @@ app.post("/send-call", verifyUser, async (req, res) => {
       data: {
         type: "incoming_call",
         callId,
+        conversationId,
+        convoId: conversationId,
         callerUid,
         receiverUid,
         callType,
         callerName,
-        title,
-        body,
+        callerUsername: callerName,
+        senderName: callerName,
         click_action: "FLUTTER_NOTIFICATION_CLICK",
       },
     });
