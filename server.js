@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const { createHmac, randomBytes } = require("crypto");
 
 const app = express();
 
@@ -285,12 +286,153 @@ async function deleteNotificationDoc({ toUid, notificationId }) {
     .catch(() => {});
 }
 
+
+function uniqueCleanStrings(values) {
+  const out = [];
+  const seen = new Set();
+
+  values.forEach((value) => {
+    const clean = cleanText(value);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  });
+
+  return out;
+}
+
+function imageKitFileIdsFromPost(postData = {}) {
+  return uniqueCleanStrings([
+    postData.mediaFileId,
+    postData.thumbnailFileId,
+    postData.imageKitFileId,
+    postData.imageKitThumbnailFileId,
+    postData.mediaImageKitFileId,
+    postData.thumbnailImageKitFileId,
+  ]);
+}
+
+async function deleteImageKitFile(fileId) {
+  const cleanFileId = cleanText(fileId);
+  const privateKey = cleanText(process.env.IMAGEKIT_PRIVATE_KEY);
+
+  if (!cleanFileId) return { ok: true, skipped: true, reason: "empty-file-id" };
+
+  if (!privateKey) {
+    console.warn("IMAGEKIT_PRIVATE_KEY is not configured; skipping media delete", cleanFileId);
+    return { ok: true, skipped: true, reason: "missing-imagekit-private-key" };
+  }
+
+  const response = await fetch(
+    `https://api.imagekit.io/v1/files/${encodeURIComponent(cleanFileId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${privateKey}:`).toString("base64")}`,
+      },
+    },
+  );
+
+  if (response.status === 404) {
+    return { ok: true, skipped: true, reason: "not-found" };
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`imagekit-delete-failed:${response.status}:${body}`);
+  }
+
+  return { ok: true, deleted: true };
+}
+
+async function deleteImageKitFiles(fileIds) {
+  const results = [];
+
+  for (const fileId of uniqueCleanStrings(fileIds)) {
+    try {
+      const result = await deleteImageKitFile(fileId);
+      results.push({ fileId, ...result });
+    } catch (error) {
+      console.warn("Failed to delete ImageKit file", fileId, error.message);
+      results.push({ fileId, ok: false, error: error.message });
+    }
+  }
+
+  return results;
+}
+
+async function deleteQueryBatch(query, batchSize = 400) {
+  let deleted = 0;
+
+  while (true) {
+    const snap = await query.limit(batchSize).get();
+    if (snap.empty) break;
+
+    const batch = db.batch();
+    snap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    deleted += snap.size;
+
+    if (snap.size < batchSize) break;
+  }
+
+  return deleted;
+}
+
+async function deletePostSubcollections(postRef) {
+  let deletedLikes = 0;
+  let deletedComments = 0;
+  let deletedCommentLikes = 0;
+
+  deletedLikes += await deleteQueryBatch(postRef.collection("likes"), 400);
+
+  while (true) {
+    const commentsSnap = await postRef.collection("comments").limit(100).get();
+    if (commentsSnap.empty) break;
+
+    for (const commentDoc of commentsSnap.docs) {
+      deletedCommentLikes += await deleteQueryBatch(commentDoc.ref.collection("likes"), 400);
+    }
+
+    const batch = db.batch();
+    commentsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    deletedComments += commentsSnap.size;
+  }
+
+  return { deletedLikes, deletedComments, deletedCommentLikes };
+}
+
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "MONO Notification Server" });
 });
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+
+app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
+  try {
+    const privateKey = cleanText(process.env.IMAGEKIT_PRIVATE_KEY);
+
+    if (!privateKey) {
+      return res.status(503).json({ ok: false, error: "ImageKit private key is not configured" });
+    }
+
+    const token = randomBytes(24).toString("hex");
+    const expire = Math.floor(Date.now() / 1000) + 10 * 60;
+    const signature = createHmac("sha1", privateKey)
+      .update(`${token}${expire}`)
+      .digest("hex");
+
+    return res.json({ ok: true, token, expire, signature });
+  } catch (error) {
+    console.error("imagekit-upload-auth error", error);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
 });
 
 app.post("/send-message", verifyUser, async (req, res) => {
@@ -811,6 +953,90 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
       ok: false,
       error: notFound ? "User not found" : "Server error",
     });
+  }
+});
+
+
+
+app.post("/delete-imagekit-file", verifyUser, async (req, res) => {
+  try {
+    const fileId = cleanText(req.body.fileId);
+
+    if (!fileId) {
+      return res.status(400).json({ ok: false, error: "fileId is required" });
+    }
+
+    const result = await deleteImageKitFile(fileId);
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("delete-imagekit-file error", error);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+app.post("/delete-post", verifyUser, async (req, res) => {
+  try {
+    const actorUid = req.user.uid;
+    const postId = cleanText(req.body.postId);
+
+    if (!postId) {
+      return res.status(400).json({ ok: false, error: "postId is required" });
+    }
+
+    const postRef = db.collection("posts").doc(postId);
+    const postSnap = await postRef.get();
+
+    if (!postSnap.exists) {
+      return res.json({ ok: true, deleted: false, reason: "post-not-found" });
+    }
+
+    const postData = postSnap.data() || {};
+    const ownerUid = cleanText(postData.userId);
+
+    if (!ownerUid || actorUid !== ownerUid) {
+      return res.status(403).json({ ok: false, error: "Permission denied" });
+    }
+
+    const fileIds = imageKitFileIdsFromPost(postData);
+    const subDeletes = await deletePostSubcollections(postRef);
+
+    const batch = db.batch();
+    batch.delete(postRef);
+    batch.update(db.collection("users").doc(ownerUid), {
+      postsCount: admin.firestore.FieldValue.increment(-1),
+    });
+    await batch.commit();
+
+    const deletedSavedPosts = await deleteQueryBatch(
+      db.collectionGroup("savedPosts").where("postId", "==", postId),
+      300,
+    ).catch((error) => {
+      console.warn("Failed to delete savedPosts for post", postId, error.message);
+      return 0;
+    });
+
+    const deletedNotifications = await deleteQueryBatch(
+      db.collectionGroup("notifications").where("postId", "==", postId),
+      300,
+    ).catch((error) => {
+      console.warn("Failed to delete notifications for post", postId, error.message);
+      return 0;
+    });
+
+    const mediaDeletes = await deleteImageKitFiles(fileIds);
+
+    return res.json({
+      ok: true,
+      deleted: true,
+      postId,
+      deletedSavedPosts,
+      deletedNotifications,
+      mediaDeletes,
+      ...subDeletes,
+    });
+  } catch (error) {
+    console.error("delete-post error", error);
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
