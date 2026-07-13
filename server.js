@@ -854,6 +854,140 @@ async function deleteUserCallsCompletely(uid) {
     deletedCalls,
   };
 }
+async function countQuery(query) {
+  const snap = await query.count().get();
+  const data = snap.data() || {};
+  return Number(data.count || 0);
+}
+
+async function safeCount(label, query) {
+  try {
+    return {
+      label,
+      value: await countQuery(query),
+      error: "",
+    };
+  } catch (error) {
+    console.warn("stats count failed", label, error.message);
+
+    return {
+      label,
+      value: null,
+      error: error.message || "count-failed",
+    };
+  }
+}
+
+function timestampToIso(value) {
+  try {
+    if (!value) return "";
+    if (typeof value.toDate === "function") return value.toDate().toISOString();
+    if (value instanceof Date) return value.toISOString();
+  } catch (_) {}
+
+  return "";
+}
+
+function readPossibleFileSize(data = {}) {
+  const values = [
+    data.fileSize,
+    data.mediaFileSize,
+    data.mediaSize,
+    data.sizeBytes,
+    data.mediaSizeBytes,
+    data.thumbnailFileSize,
+    data.thumbnailSizeBytes,
+  ];
+
+  let total = 0;
+
+  values.forEach((value) => {
+    const n = Number(value || 0);
+    if (Number.isFinite(n) && n > 0) total += n;
+  });
+
+  return total;
+}
+
+async function buildMediaSummary() {
+  let postsWithMedia = 0;
+  let storiesWithMedia = 0;
+  let reels = 0;
+  let images = 0;
+  let knownFileIds = 0;
+  let knownBytes = 0;
+  const sampleLimit = 1000;
+
+  const postsSnap = await db.collection("posts").limit(sampleLimit).get();
+
+  postsSnap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    const mediaUrl = cleanText(data.mediaUrl);
+    const thumbnailUrl = cleanText(data.thumbnailUrl);
+    const type = cleanText(data.type).toLowerCase();
+
+    if (mediaUrl || thumbnailUrl) postsWithMedia += 1;
+    if (type === "reel") reels += 1;
+    if (type === "image") images += 1;
+
+    knownFileIds += imageKitFileIdsFromPost(data).length;
+    knownBytes += readPossibleFileSize(data);
+  });
+
+  const storiesSnap = await db.collection("stories").limit(sampleLimit).get();
+
+  storiesSnap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    const mediaUrl = cleanText(data.mediaUrl);
+    const thumbnailUrl = cleanText(data.thumbnailUrl);
+
+    if (mediaUrl || thumbnailUrl) storiesWithMedia += 1;
+
+    knownFileIds += imageKitFileIdsFromStory(data).length;
+    knownBytes += readPossibleFileSize(data);
+  });
+
+  return {
+    postsSampled: postsSnap.size,
+    storiesSampled: storiesSnap.size,
+    sampleLimit,
+    postsWithMedia,
+    storiesWithMedia,
+    imagePostsInSample: images,
+    reelPostsInSample: reels,
+    knownImageKitFileIds: knownFileIds,
+    knownStoredBytes: knownBytes,
+    knownStoredMB: Number((knownBytes / 1024 / 1024).toFixed(2)),
+    note:
+      "Known storage is accurate only for files where file size/fileId was saved in Firestore. ImageKit dashboard remains the source of truth for total storage and bandwidth.",
+  };
+}
+
+async function getRecentAdminLogs(limit = 8) {
+  try {
+    const snap = await db
+      .collection("adminLogs")
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+
+    return snap.docs.map((doc) => {
+      const data = doc.data() || {};
+
+      return {
+        id: doc.id,
+        action: cleanText(data.action),
+        adminUid: cleanText(data.adminUid),
+        targetUid: cleanText(data.targetUid),
+        reason: cleanText(data.reason),
+        createdAt: timestampToIso(data.createdAt),
+      };
+    });
+  } catch (error) {
+    console.warn("Failed to read admin logs", error.message);
+    return [];
+  }
+}
 
 app.get("/", (req, res) => {
   res.json({
@@ -1566,6 +1700,78 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
     return res.status(notFound ? 404 : 500).json({
       ok: false,
       error: notFound ? "User not found" : "Server error",
+    });
+  }
+});
+app.get("/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const now = admin.firestore.Timestamp.now();
+
+    const countResults = await Promise.all([
+      safeCount("usersTotal", db.collection("users")),
+      safeCount(
+        "usersActive",
+        db.collection("users").where("status", "==", "active"),
+      ),
+      safeCount(
+        "usersBanned",
+        db.collection("users").where("banned", "==", true),
+      ),
+      safeCount(
+        "usersDeleted",
+        db.collection("users").where("deleted", "==", true),
+      ),
+      safeCount("postsTotal", db.collection("posts")),
+      safeCount(
+        "postsImages",
+        db.collection("posts").where("type", "==", "image"),
+      ),
+      safeCount(
+        "postsReels",
+        db.collection("posts").where("type", "==", "reel"),
+      ),
+      safeCount("storiesTotal", db.collection("stories")),
+      safeCount(
+        "storiesActive",
+        db.collection("stories").where("expiresAt", ">", now),
+      ),
+      safeCount("conversationsTotal", db.collection("conversations")),
+      safeCount("messagesTotal", db.collectionGroup("messages")),
+      safeCount("callsTotal", db.collection("calls")),
+      safeCount("adminLogsTotal", db.collection("adminLogs")),
+    ]);
+
+    const counts = {};
+    const countErrors = {};
+
+    countResults.forEach((item) => {
+      counts[item.label] = item.value;
+      if (item.error) countErrors[item.label] = item.error;
+    });
+
+    const [recentAdminLogs, media] = await Promise.all([
+      getRecentAdminLogs(8),
+      buildMediaSummary().catch((error) => ({
+        error: error.message || "media-summary-failed",
+      })),
+    ]);
+
+    return res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      counts,
+      countErrors,
+      media,
+      recentAdminLogs,
+      limitsNote:
+        "This endpoint counts app data in Firestore. Firebase/Vercel/ImageKit plan limits must still be checked from each provider dashboard.",
+    });
+  } catch (error) {
+    console.error("admin stats error", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message || "Server error",
     });
   }
 });
