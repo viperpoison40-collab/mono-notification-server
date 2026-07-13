@@ -44,6 +44,20 @@ function safeData(data = {}) {
   return output;
 }
 
+function uniqueCleanStrings(values) {
+  const out = [];
+  const seen = new Set();
+
+  values.forEach((value) => {
+    const clean = cleanText(value);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  });
+
+  return out;
+}
+
 async function verifyUser(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -52,35 +66,91 @@ async function verifyUser(req, res, next) {
       : "";
 
     if (!token) {
-      return res.status(401).json({ ok: false, error: "Missing Firebase ID token" });
+      return res.status(401).json({
+        ok: false,
+        error: "Missing Firebase ID token",
+      });
     }
 
     const decoded = await admin.auth().verifyIdToken(token);
     req.user = decoded;
     return next();
   } catch (_) {
-    return res.status(401).json({ ok: false, error: "Invalid Firebase ID token" });
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid Firebase ID token",
+    });
+  }
+}
+
+async function isAdminUser(uid, email = "") {
+  const cleanUid = cleanText(uid);
+  const cleanEmail = cleanText(email).toLowerCase();
+
+  const ownerEmails = uniqueCleanStrings([
+    "viper.poison40@gmail.com",
+    ...(cleanText(process.env.ADMIN_EMAILS)
+      ? process.env.ADMIN_EMAILS.split(",")
+      : []),
+  ]).map((e) => e.toLowerCase());
+
+  if (cleanEmail && ownerEmails.includes(cleanEmail)) return true;
+  if (!cleanUid) return false;
+
+  try {
+    const snap = await db.collection("users").doc(cleanUid).get();
+    const data = snap.data() || {};
+    const role = cleanText(data.role).toLowerCase();
+
+    return data.isAdmin === true || role === "admin" || role === "owner";
+  } catch (error) {
+    console.warn("Failed to check admin user", cleanUid, error.message);
+    return false;
+  }
+}
+
+async function verifyAdmin(req, res, next) {
+  try {
+    const ok = await isAdminUser(req.user?.uid, req.user?.email);
+    if (!ok) {
+      return res.status(403).json({
+        ok: false,
+        error: "Admin permission required",
+      });
+    }
+
+    return next();
+  } catch (_) {
+    return res.status(403).json({
+      ok: false,
+      error: "Admin permission required",
+    });
   }
 }
 
 async function getUserTitle(uid) {
   if (!uid) return "MONO";
+
   try {
     const snap = await db.collection("users").doc(uid).get();
     const data = snap.data() || {};
+
     const displayName = cleanText(data.displayName);
     if (displayName) return displayName;
+
     const username = cleanText(data.username);
     if (username) return `@${username}`;
   } catch (error) {
     console.warn("Failed to read user title", uid, error.message);
   }
+
   return "MONO";
 }
 
 async function getPublicUserData(uid) {
   const snap = await db.collection("users").doc(uid).get();
   const data = snap.data() || {};
+
   return {
     username: cleanText(data.username) || cleanText(data.displayName) || "user",
     avatarUrl: cleanText(data.avatarUrl),
@@ -88,7 +158,13 @@ async function getPublicUserData(uid) {
 }
 
 async function getUserTokens(uid) {
-  const snap = await db.collection("users").doc(uid).collection("fcmTokens").limit(30).get();
+  const snap = await db
+    .collection("users")
+    .doc(uid)
+    .collection("fcmTokens")
+    .limit(30)
+    .get();
+
   const tokens = new Set();
 
   snap.docs.forEach((doc) => {
@@ -102,10 +178,13 @@ async function getUserTokens(uid) {
 
 async function deleteBadTokens(uid, badTokens) {
   if (!uid || badTokens.length === 0) return;
+
   const batch = db.batch();
 
   badTokens.forEach((token) => {
-    batch.delete(db.collection("users").doc(uid).collection("fcmTokens").doc(token));
+    batch.delete(
+      db.collection("users").doc(uid).collection("fcmTokens").doc(token),
+    );
   });
 
   await batch.commit();
@@ -116,6 +195,7 @@ function collectBadTokens(response, tokens, uid) {
 
   response.responses.forEach((result, index) => {
     if (result.success) return;
+
     const code = result.error?.code || "";
 
     if (
@@ -148,7 +228,12 @@ async function sendPushToUser({
   const tokens = await getUserTokens(uid);
 
   if (tokens.length === 0) {
-    return { ok: true, sent: 0, failed: 0, message: "No FCM tokens found for this user" };
+    return {
+      ok: true,
+      sent: 0,
+      failed: 0,
+      message: "No FCM tokens found for this user",
+    };
   }
 
   const cleanData = safeData({ ...data, title, body });
@@ -183,11 +268,20 @@ async function sendPushToUser({
   };
 }
 
-async function sendDataOnlyPushToUser({ uid, data = {}, collapseKey = "mono_data" }) {
+async function sendDataOnlyPushToUser({
+  uid,
+  data = {},
+  collapseKey = "mono_data",
+}) {
   const tokens = await getUserTokens(uid);
 
   if (tokens.length === 0) {
-    return { ok: true, sent: 0, failed: 0, message: "No FCM tokens found for this user" };
+    return {
+      ok: true,
+      sent: 0,
+      failed: 0,
+      message: "No FCM tokens found for this user",
+    };
   }
 
   const response = await admin.messaging().sendEachForMulticast({
@@ -251,10 +345,15 @@ async function addNotificationDoc({
   const cleanCommentId = cleanText(commentId);
   const cleanNotificationId = cleanText(notificationId);
 
-  if (!cleanToUid || !cleanType || !cleanFromUid || cleanToUid === cleanFromUid) return;
+  if (!cleanToUid || !cleanType || !cleanFromUid) return;
+  if (cleanToUid === cleanFromUid) return;
 
   const ref = cleanNotificationId
-    ? db.collection("users").doc(cleanToUid).collection("notifications").doc(cleanNotificationId)
+    ? db
+        .collection("users")
+        .doc(cleanToUid)
+        .collection("notifications")
+        .doc(cleanNotificationId)
     : db.collection("users").doc(cleanToUid).collection("notifications").doc();
 
   await ref.set(
@@ -275,6 +374,7 @@ async function addNotificationDoc({
 async function deleteNotificationDoc({ toUid, notificationId }) {
   const cleanToUid = cleanText(toUid);
   const cleanNotificationId = cleanText(notificationId);
+
   if (!cleanToUid || !cleanNotificationId) return;
 
   await db
@@ -284,21 +384,6 @@ async function deleteNotificationDoc({ toUid, notificationId }) {
     .doc(cleanNotificationId)
     .delete()
     .catch(() => {});
-}
-
-
-function uniqueCleanStrings(values) {
-  const out = [];
-  const seen = new Set();
-
-  values.forEach((value) => {
-    const clean = cleanText(value);
-    if (!clean || seen.has(clean)) return;
-    seen.add(clean);
-    out.push(clean);
-  });
-
-  return out;
 }
 
 function imageKitFileIdsFromPost(postData = {}) {
@@ -312,15 +397,39 @@ function imageKitFileIdsFromPost(postData = {}) {
   ]);
 }
 
+function imageKitFileIdsFromStory(storyData = {}) {
+  return uniqueCleanStrings([
+    storyData.mediaFileId,
+    storyData.imageKitFileId,
+    storyData.mediaImageKitFileId,
+    storyData.thumbnailFileId,
+    storyData.thumbnailImageKitFileId,
+  ]);
+}
+
 async function deleteImageKitFile(fileId) {
   const cleanFileId = cleanText(fileId);
   const privateKey = cleanText(process.env.IMAGEKIT_PRIVATE_KEY);
 
-  if (!cleanFileId) return { ok: true, skipped: true, reason: "empty-file-id" };
+  if (!cleanFileId) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "empty-file-id",
+    };
+  }
 
   if (!privateKey) {
-    console.warn("IMAGEKIT_PRIVATE_KEY is not configured; skipping media delete", cleanFileId);
-    return { ok: true, skipped: true, reason: "missing-imagekit-private-key" };
+    console.warn(
+      "IMAGEKIT_PRIVATE_KEY is not configured; skipping media delete",
+      cleanFileId,
+    );
+
+    return {
+      ok: true,
+      skipped: true,
+      reason: "missing-imagekit-private-key",
+    };
   }
 
   const response = await fetch(
@@ -328,13 +437,19 @@ async function deleteImageKitFile(fileId) {
     {
       method: "DELETE",
       headers: {
-        Authorization: `Basic ${Buffer.from(`${privateKey}:`).toString("base64")}`,
+        Authorization: `Basic ${Buffer.from(`${privateKey}:`).toString(
+          "base64",
+        )}`,
       },
     },
   );
 
   if (response.status === 404) {
-    return { ok: true, skipped: true, reason: "not-found" };
+    return {
+      ok: true,
+      skipped: true,
+      reason: "not-found",
+    };
   }
 
   if (!response.ok) {
@@ -342,7 +457,10 @@ async function deleteImageKitFile(fileId) {
     throw new Error(`imagekit-delete-failed:${response.status}:${body}`);
   }
 
-  return { ok: true, deleted: true };
+  return {
+    ok: true,
+    deleted: true,
+  };
 }
 
 async function deleteImageKitFiles(fileIds) {
@@ -354,7 +472,11 @@ async function deleteImageKitFiles(fileIds) {
       results.push({ fileId, ...result });
     } catch (error) {
       console.warn("Failed to delete ImageKit file", fileId, error.message);
-      results.push({ fileId, ok: false, error: error.message });
+      results.push({
+        fileId,
+        ok: false,
+        error: error.message,
+      });
     }
   }
 
@@ -392,7 +514,10 @@ async function deletePostSubcollections(postRef) {
     if (commentsSnap.empty) break;
 
     for (const commentDoc of commentsSnap.docs) {
-      deletedCommentLikes += await deleteQueryBatch(commentDoc.ref.collection("likes"), 400);
+      deletedCommentLikes += await deleteQueryBatch(
+        commentDoc.ref.collection("likes"),
+        400,
+      );
     }
 
     const batch = db.batch();
@@ -402,24 +527,355 @@ async function deletePostSubcollections(postRef) {
     deletedComments += commentsSnap.size;
   }
 
-  return { deletedLikes, deletedComments, deletedCommentLikes };
+  return {
+    deletedLikes,
+    deletedComments,
+    deletedCommentLikes,
+  };
+}
+
+async function deleteUserRootSubcollections(uid) {
+  const userRef = db.collection("users").doc(uid);
+
+  const names = [
+    "fcmTokens",
+    "followers",
+    "following",
+    "savedPosts",
+    "notifications",
+    "blocked",
+  ];
+
+  const result = {};
+
+  for (const name of names) {
+    result[name] = await deleteQueryBatch(userRef.collection(name), 300).catch(
+      (error) => {
+        console.warn(`Failed to delete users/${uid}/${name}`, error.message);
+        return 0;
+      },
+    );
+  }
+
+  return result;
+}
+
+async function deleteUserPostsCompletely(uid) {
+  let deletedPosts = 0;
+  let deletedLikes = 0;
+  let deletedComments = 0;
+  let deletedCommentLikes = 0;
+  let deletedSavedPosts = 0;
+  let deletedNotifications = 0;
+  let mediaDeletes = [];
+
+  while (true) {
+    const snap = await db
+      .collection("posts")
+      .where("userId", "==", uid)
+      .limit(60)
+      .get();
+
+    if (snap.empty) break;
+
+    const batch = db.batch();
+
+    for (const postDoc of snap.docs) {
+      const postData = postDoc.data() || {};
+      const fileIds = imageKitFileIdsFromPost(postData);
+      const sub = await deletePostSubcollections(postDoc.ref);
+
+      deletedLikes += sub.deletedLikes || 0;
+      deletedComments += sub.deletedComments || 0;
+      deletedCommentLikes += sub.deletedCommentLikes || 0;
+
+      deletedSavedPosts += await deleteQueryBatch(
+        db.collectionGroup("savedPosts").where("postId", "==", postDoc.id),
+        300,
+      ).catch((error) => {
+        console.warn(
+          "Failed to delete savedPosts for post",
+          postDoc.id,
+          error.message,
+        );
+        return 0;
+      });
+
+      deletedNotifications += await deleteQueryBatch(
+        db.collectionGroup("notifications").where("postId", "==", postDoc.id),
+        300,
+      ).catch((error) => {
+        console.warn(
+          "Failed to delete notifications for post",
+          postDoc.id,
+          error.message,
+        );
+        return 0;
+      });
+
+      mediaDeletes = mediaDeletes.concat(await deleteImageKitFiles(fileIds));
+
+      batch.delete(postDoc.ref);
+      deletedPosts += 1;
+    }
+
+    await batch.commit();
+
+    if (snap.size < 60) break;
+  }
+
+  return {
+    deletedPosts,
+    deletedLikes,
+    deletedComments,
+    deletedCommentLikes,
+    deletedSavedPosts,
+    deletedNotifications,
+    mediaDeletes,
+  };
+}
+
+async function deleteUserStoriesCompletely(uid) {
+  let deletedStories = 0;
+  let mediaDeletes = [];
+
+  while (true) {
+    const snap = await db
+      .collection("stories")
+      .where("uid", "==", uid)
+      .limit(100)
+      .get();
+
+    if (snap.empty) break;
+
+    const batch = db.batch();
+
+    for (const storyDoc of snap.docs) {
+      const storyData = storyDoc.data() || {};
+      mediaDeletes = mediaDeletes.concat(
+        await deleteImageKitFiles(imageKitFileIdsFromStory(storyData)),
+      );
+
+      batch.delete(storyDoc.ref);
+      deletedStories += 1;
+    }
+
+    await batch.commit();
+
+    if (snap.size < 100) break;
+  }
+
+  return {
+    deletedStories,
+    storyMediaDeletes: mediaDeletes,
+  };
+}
+
+async function deleteUserConversationsCompletely(uid) {
+  let deletedConversations = 0;
+  let deletedMessages = 0;
+
+  while (true) {
+    const snap = await db
+      .collection("conversations")
+      .where("participants", "array-contains", uid)
+      .limit(80)
+      .get();
+
+    if (snap.empty) break;
+
+    const batch = db.batch();
+
+    for (const convoDoc of snap.docs) {
+      deletedMessages += await deleteQueryBatch(
+        convoDoc.ref.collection("messages"),
+        400,
+      );
+
+      batch.delete(convoDoc.ref);
+      deletedConversations += 1;
+    }
+
+    await batch.commit();
+
+    if (snap.size < 80) break;
+  }
+
+  return {
+    deletedConversations,
+    deletedMessages,
+  };
+}
+
+async function deleteUserReactionsEverywhere(uid) {
+  let deletedPostLikes = 0;
+  let deletedCommentLikes = 0;
+  let deletedCommentsOnOtherPosts = 0;
+
+  while (true) {
+    const snap = await db
+      .collectionGroup("likes")
+      .where("uid", "==", uid)
+      .limit(100)
+      .get();
+
+    if (snap.empty) break;
+
+    for (const likeDoc of snap.docs) {
+      const parentDoc = likeDoc.ref.parent.parent;
+
+      if (!parentDoc) {
+        await likeDoc.ref.delete().catch(() => {});
+        continue;
+      }
+
+      const parentCollection = parentDoc.ref.parent.id;
+      const batch = db.batch();
+
+      batch.delete(likeDoc.ref);
+
+      if (parentCollection === "posts") {
+        batch.update(parentDoc.ref, {
+          likesCount: admin.firestore.FieldValue.increment(-1),
+        });
+        deletedPostLikes += 1;
+      } else if (parentCollection === "comments") {
+        batch.update(parentDoc.ref, {
+          likesCount: admin.firestore.FieldValue.increment(-1),
+        });
+        deletedCommentLikes += 1;
+      }
+
+      await batch.commit().catch(async (error) => {
+        console.warn(
+          "Failed to delete user like",
+          likeDoc.ref.path,
+          error.message,
+        );
+
+        await likeDoc.ref.delete().catch(() => {});
+      });
+    }
+
+    if (snap.size < 100) break;
+  }
+
+  while (true) {
+    const snap = await db
+      .collectionGroup("comments")
+      .where("userId", "==", uid)
+      .limit(80)
+      .get();
+
+    if (snap.empty) break;
+
+    for (const commentDoc of snap.docs) {
+      const postRef = commentDoc.ref.parent.parent;
+
+      await deleteQueryBatch(commentDoc.ref.collection("likes"), 300).catch(
+        () => 0,
+      );
+
+      const batch = db.batch();
+
+      batch.delete(commentDoc.ref);
+
+      if (postRef) {
+        batch.update(postRef, {
+          commentsCount: admin.firestore.FieldValue.increment(-1),
+        });
+      }
+
+      await batch.commit().catch(async (error) => {
+        console.warn(
+          "Failed to delete user comment",
+          commentDoc.ref.path,
+          error.message,
+        );
+
+        await commentDoc.ref.delete().catch(() => {});
+      });
+
+      deletedCommentsOnOtherPosts += 1;
+    }
+
+    if (snap.size < 80) break;
+  }
+
+  return {
+    deletedPostLikes,
+    deletedCommentLikes,
+    deletedCommentsOnOtherPosts,
+  };
+}
+
+async function deleteUserReferencesEverywhere(uid) {
+  const result = {};
+
+  result.followers = await deleteQueryBatch(
+    db.collectionGroup("followers").where("uid", "==", uid),
+    300,
+  ).catch(() => 0);
+
+  result.following = await deleteQueryBatch(
+    db.collectionGroup("following").where("uid", "==", uid),
+    300,
+  ).catch(() => 0);
+
+  result.blocked = await deleteQueryBatch(
+    db.collectionGroup("blocked").where("uid", "==", uid),
+    300,
+  ).catch(() => 0);
+
+  result.notificationsFromUser = await deleteQueryBatch(
+    db.collectionGroup("notifications").where("fromUid", "==", uid),
+    300,
+  ).catch(() => 0);
+
+  result.savedPostsOwnedByUser = await deleteQueryBatch(
+    db.collectionGroup("savedPosts").where("ownerUid", "==", uid),
+    300,
+  ).catch(() => 0);
+
+  return result;
+}
+
+async function deleteUserCallsCompletely(uid) {
+  let deletedCalls = 0;
+  const fields = ["callerUid", "receiverUid"];
+
+  for (const field of fields) {
+    deletedCalls += await deleteQueryBatch(
+      db.collection("calls").where(field, "==", uid),
+      200,
+    ).catch(() => 0);
+  }
+
+  return {
+    deletedCalls,
+  };
 }
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "MONO Notification Server" });
+  res.json({
+    ok: true,
+    service: "MONO Notification Server",
+  });
 });
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-
 app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
   try {
     const privateKey = cleanText(process.env.IMAGEKIT_PRIVATE_KEY);
 
     if (!privateKey) {
-      return res.status(503).json({ ok: false, error: "ImageKit private key is not configured" });
+      return res.status(503).json({
+        ok: false,
+        error: "ImageKit private key is not configured",
+      });
     }
 
     const token = randomBytes(24).toString("hex");
@@ -428,10 +884,18 @@ app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
       .update(`${token}${expire}`)
       .digest("hex");
 
-    return res.json({ ok: true, token, expire, signature });
+    return res.json({
+      ok: true,
+      token,
+      expire,
+      signature,
+    });
   } catch (error) {
     console.error("imagekit-upload-auth error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -444,14 +908,21 @@ app.post("/send-message", verifyUser, async (req, res) => {
     const text = cleanText(req.body.text);
 
     if (!toUid || !convoId) {
-      return res.status(400).json({ ok: false, error: "toUid and convoId are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "toUid and convoId are required",
+      });
     }
 
     if (toUid === senderUid) {
-      return res.status(400).json({ ok: false, error: "Cannot send notification to yourself" });
+      return res.status(400).json({
+        ok: false,
+        error: "Cannot send notification to yourself",
+      });
     }
 
     const senderName = await getUserTitle(senderUid);
+
     const result = await sendPushToUser({
       uid: toUid,
       title: senderName,
@@ -471,7 +942,10 @@ app.post("/send-message", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-message error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -480,15 +954,24 @@ app.post("/send-call", verifyUser, async (req, res) => {
     const callerUid = req.user.uid;
     const receiverUid = cleanText(req.body.receiverUid);
     const callId = cleanText(req.body.callId);
-    const conversationId = cleanText(req.body.conversationId || req.body.convoId);
+    const conversationId = cleanText(
+      req.body.conversationId || req.body.convoId,
+    );
+
     const callType = cleanText(req.body.callType) === "video" ? "video" : "voice";
 
     if (!receiverUid || !callId) {
-      return res.status(400).json({ ok: false, error: "receiverUid and callId are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "receiverUid and callId are required",
+      });
     }
 
     if (receiverUid === callerUid) {
-      return res.status(400).json({ ok: false, error: "Cannot call yourself" });
+      return res.status(400).json({
+        ok: false,
+        error: "Cannot call yourself",
+      });
     }
 
     const fallbackCallerName = cleanText(req.body.callerName);
@@ -515,7 +998,10 @@ app.post("/send-call", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-call error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -530,11 +1016,17 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     const commentId = cleanText(req.body.commentId);
 
     if (!toUid) {
-      return res.status(400).json({ ok: false, error: "toUid is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "toUid is required",
+      });
     }
 
     if (toUid === fromUid) {
-      return res.status(400).json({ ok: false, error: "Cannot send notification to yourself" });
+      return res.status(400).json({
+        ok: false,
+        error: "Cannot send notification to yourself",
+      });
     }
 
     const fromName = await getUserTitle(fromUid);
@@ -543,7 +1035,9 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     let title = "إشعار جديد";
     let body = fallbackText || "لديك إشعار جديد";
     let collapseKey = "mono_general";
-    let tag = notificationId ? `notification_${notificationId}` : "mono_general";
+    let tag = notificationId
+      ? `notification_${notificationId}`
+      : "mono_general";
 
     if (notificationType === "like") {
       type = "like";
@@ -554,7 +1048,9 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     } else if (notificationType === "comment") {
       type = "comment";
       title = "تعليق جديد";
-      body = fallbackText ? `${fromName}: ${shortText(fallbackText, 90)}` : `${fromName} علّق على منشورك`;
+      body = fallbackText
+        ? `${fromName}: ${shortText(fallbackText, 90)}`
+        : `${fromName} علّق على منشورك`;
       collapseKey = postId ? `post_${postId}` : "mono_comment";
       tag = postId ? `post_${postId}` : "mono_comment";
     } else if (notificationType === "comment_like") {
@@ -592,7 +1088,10 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-notification error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -602,19 +1101,26 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
     const postId = cleanText(req.body.postId);
 
     if (!postId) {
-      return res.status(400).json({ ok: false, error: "postId is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "postId is required",
+      });
     }
 
     const postRef = db.collection("posts").doc(postId);
     const likeRef = postRef.collection("likes").doc(actorUid);
 
     const result = await db.runTransaction(async (tx) => {
-      const [postSnap, likeSnap] = await Promise.all([tx.get(postRef), tx.get(likeRef)]);
+      const [postSnap, likeSnap] = await Promise.all([
+        tx.get(postRef),
+        tx.get(likeRef),
+      ]);
 
       if (!postSnap.exists) throw new Error("post-not-found");
 
       const postData = postSnap.data() || {};
       const postOwnerUid = cleanText(postData.userId);
+
       let likesCount = Number(postData.likesCount || 0);
       const commentsCount = Number(postData.commentsCount || 0);
       let liked = false;
@@ -636,7 +1142,12 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
         trendScore: trendScore(likesCount, commentsCount),
       });
 
-      return { liked, likesCount, commentsCount, postOwnerUid };
+      return {
+        liked,
+        likesCount,
+        commentsCount,
+        postOwnerUid,
+      };
     });
 
     const notificationId = likeNotificationId(postId, actorUid);
@@ -652,14 +1163,22 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
           notificationId,
         });
       } else {
-        await deleteNotificationDoc({ toUid: result.postOwnerUid, notificationId });
+        await deleteNotificationDoc({
+          toUid: result.postOwnerUid,
+          notificationId,
+        });
       }
     }
 
-    return res.json({ ok: true, ...result });
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (error) {
     console.error("toggle-like error", error);
+
     const notFound = error.message === "post-not-found";
+
     return res.status(notFound ? 404 : 500).json({
       ok: false,
       error: notFound ? "Post not found" : "Server error",
@@ -675,11 +1194,17 @@ app.post("/add-comment", verifyUser, async (req, res) => {
     const actorUsernameFallback = cleanText(req.body.actorUsername);
 
     if (!postId || !text) {
-      return res.status(400).json({ ok: false, error: "postId and text are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "postId and text are required",
+      });
     }
 
     if (text.length > 500) {
-      return res.status(400).json({ ok: false, error: "Comment text is too long" });
+      return res.status(400).json({
+        ok: false,
+        error: "Comment text is too long",
+      });
     }
 
     const actor = await getPublicUserData(actorUid).catch(() => ({
@@ -694,6 +1219,7 @@ app.post("/add-comment", verifyUser, async (req, res) => {
 
     const result = await db.runTransaction(async (tx) => {
       const postSnap = await tx.get(postRef);
+
       if (!postSnap.exists) throw new Error("post-not-found");
 
       const postData = postSnap.data() || {};
@@ -716,7 +1242,12 @@ app.post("/add-comment", verifyUser, async (req, res) => {
         trendScore: trendScore(likesCount, commentsCount),
       });
 
-      return { commentId: commentRef.id, postOwnerUid, commentsCount, likesCount };
+      return {
+        commentId: commentRef.id,
+        postOwnerUid,
+        commentsCount,
+        likesCount,
+      };
     });
 
     if (result.postOwnerUid && result.postOwnerUid !== actorUid) {
@@ -731,10 +1262,15 @@ app.post("/add-comment", verifyUser, async (req, res) => {
       });
     }
 
-    return res.json({ ok: true, ...result });
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (error) {
     console.error("add-comment error", error);
+
     const notFound = error.message === "post-not-found";
+
     return res.status(notFound ? 404 : 500).json({
       ok: false,
       error: notFound ? "Post not found" : "Server error",
@@ -749,17 +1285,25 @@ app.post("/delete-comment", verifyUser, async (req, res) => {
     const commentId = cleanText(req.body.commentId);
 
     if (!postId || !commentId) {
-      return res.status(400).json({ ok: false, error: "postId and commentId are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "postId and commentId are required",
+      });
     }
 
     const postRef = db.collection("posts").doc(postId);
     const commentRef = postRef.collection("comments").doc(commentId);
 
     const result = await db.runTransaction(async (tx) => {
-      const [postSnap, commentSnap] = await Promise.all([tx.get(postRef), tx.get(commentRef)]);
+      const [postSnap, commentSnap] = await Promise.all([
+        tx.get(postRef),
+        tx.get(commentRef),
+      ]);
 
       if (!postSnap.exists || !commentSnap.exists) {
-        return { deleted: false };
+        return {
+          deleted: false,
+        };
       }
 
       const postData = postSnap.data() || {};
@@ -772,7 +1316,10 @@ app.post("/delete-comment", verifyUser, async (req, res) => {
       }
 
       const likesCount = Number(postData.likesCount || 0);
-      const commentsCount = Math.max(0, Number(postData.commentsCount || 0) - 1);
+      const commentsCount = Math.max(
+        0,
+        Number(postData.commentsCount || 0) - 1,
+      );
 
       tx.delete(commentRef);
       tx.update(postRef, {
@@ -780,7 +1327,13 @@ app.post("/delete-comment", verifyUser, async (req, res) => {
         trendScore: trendScore(likesCount, commentsCount),
       });
 
-      return { deleted: true, postOwnerUid, commentOwnerUid, commentsCount, likesCount };
+      return {
+        deleted: true,
+        postOwnerUid,
+        commentOwnerUid,
+        commentsCount,
+        likesCount,
+      };
     });
 
     if (result.deleted) {
@@ -790,10 +1343,15 @@ app.post("/delete-comment", verifyUser, async (req, res) => {
       });
     }
 
-    return res.json({ ok: true, ...result });
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (error) {
     console.error("delete-comment error", error);
+
     const denied = error.message === "permission-denied";
+
     return res.status(denied ? 403 : 500).json({
       ok: false,
       error: denied ? "Permission denied" : "Server error",
@@ -808,19 +1366,31 @@ app.post("/toggle-comment-like", verifyUser, async (req, res) => {
     const commentId = cleanText(req.body.commentId);
 
     if (!postId || !commentId) {
-      return res.status(400).json({ ok: false, error: "postId and commentId are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "postId and commentId are required",
+      });
     }
 
-    const commentRef = db.collection("posts").doc(postId).collection("comments").doc(commentId);
+    const commentRef = db
+      .collection("posts")
+      .doc(postId)
+      .collection("comments")
+      .doc(commentId);
+
     const likeRef = commentRef.collection("likes").doc(actorUid);
 
     const result = await db.runTransaction(async (tx) => {
-      const [commentSnap, likeSnap] = await Promise.all([tx.get(commentRef), tx.get(likeRef)]);
+      const [commentSnap, likeSnap] = await Promise.all([
+        tx.get(commentRef),
+        tx.get(likeRef),
+      ]);
 
       if (!commentSnap.exists) throw new Error("comment-not-found");
 
       const commentData = commentSnap.data() || {};
       const commentOwnerUid = cleanText(commentData.userId);
+
       let likesCount = Number(commentData.likesCount || 0);
       let liked = false;
 
@@ -836,12 +1406,22 @@ app.post("/toggle-comment-like", verifyUser, async (req, res) => {
         liked = true;
       }
 
-      tx.update(commentRef, { likesCount });
+      tx.update(commentRef, {
+        likesCount,
+      });
 
-      return { liked, likesCount, commentOwnerUid };
+      return {
+        liked,
+        likesCount,
+        commentOwnerUid,
+      };
     });
 
-    const notificationId = commentLikeNotificationId(postId, commentId, actorUid);
+    const notificationId = commentLikeNotificationId(
+      postId,
+      commentId,
+      actorUid,
+    );
 
     if (result.commentOwnerUid && result.commentOwnerUid !== actorUid) {
       if (result.liked) {
@@ -855,14 +1435,22 @@ app.post("/toggle-comment-like", verifyUser, async (req, res) => {
           notificationId,
         });
       } else {
-        await deleteNotificationDoc({ toUid: result.commentOwnerUid, notificationId });
+        await deleteNotificationDoc({
+          toUid: result.commentOwnerUid,
+          notificationId,
+        });
       }
     }
 
-    return res.json({ ok: true, ...result });
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (error) {
     console.error("toggle-comment-like error", error);
+
     const notFound = error.message === "comment-not-found";
+
     return res.status(notFound ? 404 : 500).json({
       ok: false,
       error: notFound ? "Comment not found" : "Server error",
@@ -876,11 +1464,17 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
     const otherUid = cleanText(req.body.otherUid);
 
     if (!otherUid) {
-      return res.status(400).json({ ok: false, error: "otherUid is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "otherUid is required",
+      });
     }
 
     if (meUid === otherUid) {
-      return res.status(400).json({ ok: false, error: "Cannot follow yourself" });
+      return res.status(400).json({
+        ok: false,
+        error: "Cannot follow yourself",
+      });
     }
 
     const meRef = db.collection("users").doc(meUid);
@@ -895,10 +1489,13 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
         tx.get(followerRef),
       ]);
 
-      if (!meSnap.exists || !otherSnap.exists) throw new Error("user-not-found");
+      if (!meSnap.exists || !otherSnap.exists) {
+        throw new Error("user-not-found");
+      }
 
       const meData = meSnap.data() || {};
       const otherData = otherSnap.data() || {};
+
       let followingCount = Number(meData.followingCount || 0);
       let followersCount = Number(otherData.followersCount || 0);
       let following = false;
@@ -906,6 +1503,7 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
       if (followerSnap.exists) {
         tx.delete(followerRef);
         tx.delete(followingRef);
+
         followersCount = Math.max(0, followersCount - 1);
         followingCount = Math.max(0, followingCount - 1);
       } else {
@@ -924,10 +1522,19 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
         following = true;
       }
 
-      tx.update(otherRef, { followersCount });
-      tx.update(meRef, { followingCount });
+      tx.update(otherRef, {
+        followersCount,
+      });
 
-      return { following, followersCount, followingCount };
+      tx.update(meRef, {
+        followingCount,
+      });
+
+      return {
+        following,
+        followersCount,
+        followingCount,
+      };
     });
 
     const notificationId = followNotificationId(meUid);
@@ -942,13 +1549,21 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
         notificationId,
       });
     } else {
-      await deleteNotificationDoc({ toUid: otherUid, notificationId });
+      await deleteNotificationDoc({
+        toUid: otherUid,
+        notificationId,
+      });
     }
 
-    return res.json({ ok: true, ...result });
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (error) {
     console.error("toggle-follow error", error);
+
     const notFound = error.message === "user-not-found";
+
     return res.status(notFound ? 404 : 500).json({
       ok: false,
       error: notFound ? "User not found" : "Server error",
@@ -956,21 +1571,150 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
   }
 });
 
+app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, res) => {
+  const startedAt = Date.now();
 
+  try {
+    const adminUid = req.user.uid;
+    const targetUid = cleanText(req.body.targetUid || req.body.uid);
+    const reason = cleanText(req.body.reason);
+    const confirm = cleanText(req.body.confirm);
+
+    if (!targetUid) {
+      return res.status(400).json({
+        ok: false,
+        error: "targetUid is required",
+      });
+    }
+
+    if (targetUid === adminUid) {
+      return res.status(400).json({
+        ok: false,
+        error: "Admin cannot delete own account",
+      });
+    }
+
+    if (confirm !== "DELETE") {
+      return res.status(400).json({
+        ok: false,
+        error: "DELETE confirmation is required",
+      });
+    }
+
+    const targetUserRef = db.collection("users").doc(targetUid);
+
+    await db.collection("adminLogs").doc().set({
+      action: "delete_user_completely_started",
+      adminUid,
+      targetUid,
+      reason,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await targetUserRef
+      .set(
+        {
+          uid: targetUid,
+          status: "deleting",
+          deleted: true,
+          isDeleted: true,
+          canMessage: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      )
+      .catch(() => {});
+
+    const posts = await deleteUserPostsCompletely(targetUid);
+    const stories = await deleteUserStoriesCompletely(targetUid);
+    const conversations = await deleteUserConversationsCompletely(targetUid);
+    const reactions = await deleteUserReactionsEverywhere(targetUid);
+    const references = await deleteUserReferencesEverywhere(targetUid);
+    const calls = await deleteUserCallsCompletely(targetUid);
+    const userSubcollections = await deleteUserRootSubcollections(targetUid);
+
+    await targetUserRef.delete().catch((error) => {
+      console.warn(
+        "Failed to delete user firestore doc",
+        targetUid,
+        error.message,
+      );
+    });
+
+    let authDeleted = false;
+    let authDeleteSkipped = false;
+
+    try {
+      await admin.auth().deleteUser(targetUid);
+      authDeleted = true;
+    } catch (error) {
+      if (error.code === "auth/user-not-found") {
+        authDeleteSkipped = true;
+      } else {
+        throw error;
+      }
+    }
+
+    const result = {
+      ok: true,
+      deleted: true,
+      targetUid,
+      authDeleted,
+      authDeleteSkipped,
+      durationMs: Date.now() - startedAt,
+      posts,
+      stories,
+      conversations,
+      reactions,
+      references,
+      calls,
+      userSubcollections,
+    };
+
+    await db.collection("adminLogs").doc().set({
+      action: "delete_user_completely_finished",
+      adminUid,
+      targetUid,
+      reason,
+      result,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.json(result);
+  } catch (error) {
+    console.error("admin delete-user-completely error", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message || "Server error",
+    });
+  }
+});
 
 app.post("/delete-imagekit-file", verifyUser, async (req, res) => {
   try {
     const fileId = cleanText(req.body.fileId);
 
     if (!fileId) {
-      return res.status(400).json({ ok: false, error: "fileId is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "fileId is required",
+      });
     }
 
     const result = await deleteImageKitFile(fileId);
-    return res.json({ ok: true, ...result });
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (error) {
     console.error("delete-imagekit-file error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
@@ -980,38 +1724,55 @@ app.post("/delete-post", verifyUser, async (req, res) => {
     const postId = cleanText(req.body.postId);
 
     if (!postId) {
-      return res.status(400).json({ ok: false, error: "postId is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "postId is required",
+      });
     }
 
     const postRef = db.collection("posts").doc(postId);
     const postSnap = await postRef.get();
 
     if (!postSnap.exists) {
-      return res.json({ ok: true, deleted: false, reason: "post-not-found" });
+      return res.json({
+        ok: true,
+        deleted: false,
+        reason: "post-not-found",
+      });
     }
 
     const postData = postSnap.data() || {};
     const ownerUid = cleanText(postData.userId);
 
     if (!ownerUid || actorUid !== ownerUid) {
-      return res.status(403).json({ ok: false, error: "Permission denied" });
+      return res.status(403).json({
+        ok: false,
+        error: "Permission denied",
+      });
     }
 
     const fileIds = imageKitFileIdsFromPost(postData);
     const subDeletes = await deletePostSubcollections(postRef);
 
     const batch = db.batch();
+
     batch.delete(postRef);
+
     batch.update(db.collection("users").doc(ownerUid), {
       postsCount: admin.firestore.FieldValue.increment(-1),
     });
+
     await batch.commit();
 
     const deletedSavedPosts = await deleteQueryBatch(
       db.collectionGroup("savedPosts").where("postId", "==", postId),
       300,
     ).catch((error) => {
-      console.warn("Failed to delete savedPosts for post", postId, error.message);
+      console.warn(
+        "Failed to delete savedPosts for post",
+        postId,
+        error.message,
+      );
       return 0;
     });
 
@@ -1019,7 +1780,11 @@ app.post("/delete-post", verifyUser, async (req, res) => {
       db.collectionGroup("notifications").where("postId", "==", postId),
       300,
     ).catch((error) => {
-      console.warn("Failed to delete notifications for post", postId, error.message);
+      console.warn(
+        "Failed to delete notifications for post",
+        postId,
+        error.message,
+      );
       return 0;
     });
 
@@ -1036,7 +1801,11 @@ app.post("/delete-post", verifyUser, async (req, res) => {
     });
   } catch (error) {
     console.error("delete-post error", error);
-    return res.status(500).json({ ok: false, error: "Server error" });
+
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+    });
   }
 });
 
