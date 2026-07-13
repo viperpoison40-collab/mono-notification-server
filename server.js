@@ -706,7 +706,6 @@ async function deleteUserConversationsCompletely(uid) {
     deletedMessages,
   };
 }
-
 async function deleteUserReactionsEverywhere(uid) {
   let deletedPostLikes = 0;
   let deletedCommentLikes = 0;
@@ -722,25 +721,25 @@ async function deleteUserReactionsEverywhere(uid) {
     if (snap.empty) break;
 
     for (const likeDoc of snap.docs) {
-      const parentDoc = likeDoc.ref.parent.parent;
+      const likedParentRef = likeDoc.ref.parent.parent;
 
-      if (!parentDoc) {
+      if (!likedParentRef) {
         await likeDoc.ref.delete().catch(() => {});
         continue;
       }
 
-      const parentCollection = parentDoc.ref.parent.id;
+      const parentCollection = likedParentRef.parent.id;
       const batch = db.batch();
 
       batch.delete(likeDoc.ref);
 
       if (parentCollection === "posts") {
-        batch.update(parentDoc.ref, {
+        batch.update(likedParentRef, {
           likesCount: admin.firestore.FieldValue.increment(-1),
         });
         deletedPostLikes += 1;
       } else if (parentCollection === "comments") {
-        batch.update(parentDoc.ref, {
+        batch.update(likedParentRef, {
           likesCount: admin.firestore.FieldValue.increment(-1),
         });
         deletedCommentLikes += 1;
