@@ -1000,19 +1000,86 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/debug/imagekit", verifyUser, verifyAdmin, async (req, res) => {
+  const privateKey = getImageKitPrivateKey();
+
+  return res.json({
+    ok: true,
+    hasPrivateKey: Boolean(privateKey),
+    privateKeyLooksValid: privateKey.startsWith("private_"),
+    privateKeyPreview: maskSecret(privateKey),
+    env: {
+      IMAGEKIT_PRIVATE_KEY: Boolean(process.env.IMAGEKIT_PRIVATE_KEY),
+      IMAGEKIT_PRIVATE_API_KEY: Boolean(process.env.IMAGEKIT_PRIVATE_API_KEY),
+      IMAGEKIT_PRIVATE: Boolean(process.env.IMAGEKIT_PRIVATE),
+      IMAGEKIT_SECRET_KEY: Boolean(process.env.IMAGEKIT_SECRET_KEY),
+    },
+  });
+});
+function getImageKitPrivateKey() {
+  const candidates = [
+    process.env.IMAGEKIT_PRIVATE_KEY,
+    process.env.IMAGEKIT_PRIVATE_API_KEY,
+    process.env.IMAGEKIT_PRIVATE,
+    process.env.IMAGEKIT_SECRET_KEY,
+  ];
+
+  for (const value of candidates) {
+    const key = cleanText(value)
+      .replace(/^["']|["']$/g, "")
+      .replace(/\\n/g, "\n");
+
+    if (key) return key;
+  }
+
+  return "";
+}
+
+function maskSecret(value) {
+  const text = cleanText(value);
+  if (!text) return "";
+  if (text.length <= 10) return "***";
+  return `${text.substring(0, 8)}...${text.substring(text.length - 4)}`;
+}
+
 app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
   try {
-    const privateKey = cleanText(process.env.IMAGEKIT_PRIVATE_KEY);
+    const privateKey = getImageKitPrivateKey();
 
     if (!privateKey) {
+      console.error("ImageKit upload auth failed: missing private key env", {
+        has_IMAGEKIT_PRIVATE_KEY: Boolean(process.env.IMAGEKIT_PRIVATE_KEY),
+        has_IMAGEKIT_PRIVATE_API_KEY: Boolean(
+          process.env.IMAGEKIT_PRIVATE_API_KEY,
+        ),
+        has_IMAGEKIT_PRIVATE: Boolean(process.env.IMAGEKIT_PRIVATE),
+        has_IMAGEKIT_SECRET_KEY: Boolean(process.env.IMAGEKIT_SECRET_KEY),
+      });
+
       return res.status(503).json({
         ok: false,
-        error: "ImageKit private key is not configured",
+        code: "missing_imagekit_private_key",
+        error:
+          "IMAGEKIT_PRIVATE_KEY is missing on the server. Add it in Vercel Environment Variables, then redeploy.",
+      });
+    }
+
+    if (!privateKey.startsWith("private_")) {
+      console.error("ImageKit upload auth failed: invalid private key format", {
+        privateKeyPreview: maskSecret(privateKey),
+      });
+
+      return res.status(503).json({
+        ok: false,
+        code: "invalid_imagekit_private_key",
+        error:
+          "IMAGEKIT_PRIVATE_KEY exists but does not look like an ImageKit private key.",
       });
     }
 
     const token = randomBytes(24).toString("hex");
     const expire = Math.floor(Date.now() / 1000) + 10 * 60;
+
     const signature = createHmac("sha1", privateKey)
       .update(`${token}${expire}`)
       .digest("hex");
@@ -1025,13 +1092,14 @@ app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
     });
   } catch (error) {
     console.error("imagekit-upload-auth error", error);
+
     return res.status(500).json({
       ok: false,
-      error: "Server error",
+      code: "imagekit_upload_auth_failed",
+      error: error.message || "Server error",
     });
   }
 });
-
 app.post("/send-message", verifyUser, async (req, res) => {
   try {
     const senderUid = req.user.uid;
