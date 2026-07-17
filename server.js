@@ -371,6 +371,122 @@ async function addNotificationDoc({
   );
 }
 
+
+async function sendInteractionPush({
+  toUid,
+  type,
+  fromUid,
+  postId = "",
+  commentId = "",
+  notificationId = "",
+  text = "",
+}) {
+  const cleanToUid = cleanText(toUid);
+  const cleanType = cleanText(type).toLowerCase();
+  const cleanFromUid = cleanText(fromUid);
+  const cleanPostId = cleanText(postId);
+  const cleanCommentId = cleanText(commentId);
+  const cleanNotificationId = cleanText(notificationId);
+
+  if (!cleanToUid || !cleanType || !cleanFromUid) return null;
+  if (cleanToUid === cleanFromUid) return null;
+
+  const fromName = await getUserTitle(cleanFromUid);
+
+  let title = "إشعار جديد";
+  let body = cleanText(text) || "لديك إشعار جديد";
+  let collapseKey = "mono_general";
+  let tag = cleanNotificationId ? `notification_${cleanNotificationId}` : "mono_general";
+
+  if (cleanType === "like") {
+    title = "إعجاب جديد";
+    body = `${fromName} أعجب بمنشورك`;
+    collapseKey = cleanPostId ? `post_${cleanPostId}` : "mono_like";
+    tag = cleanNotificationId || (cleanPostId ? `like_${cleanPostId}` : "mono_like");
+  } else if (cleanType === "comment") {
+    title = "تعليق جديد";
+    body = cleanText(text)
+      ? `${fromName}: ${shortText(text, 90)}`
+      : `${fromName} علّق على منشورك`;
+    collapseKey = cleanPostId ? `post_${cleanPostId}` : "mono_comment";
+    tag = cleanNotificationId || (cleanPostId ? `comment_${cleanPostId}` : "mono_comment");
+  } else if (cleanType === "comment_like") {
+    title = "إعجاب بتعليقك";
+    body = `${fromName} أعجب بتعليقك`;
+    collapseKey = cleanPostId ? `post_${cleanPostId}` : "mono_comment_like";
+    tag = cleanNotificationId || (cleanCommentId ? `comment_like_${cleanCommentId}` : "mono_comment_like");
+  } else if (cleanType === "follow" || cleanType === "new_follow") {
+    title = "متابع جديد";
+    body = `${fromName} بدأ بمتابعتك`;
+    collapseKey = `user_${cleanFromUid}`;
+    tag = cleanNotificationId || `follow_${cleanFromUid}`;
+  }
+
+  try {
+    return await sendPushToUser({
+      uid: cleanToUid,
+      title,
+      body,
+      collapseKey,
+      tag,
+      data: {
+        type: cleanType,
+        notificationType: cleanType,
+        notificationId: cleanNotificationId,
+        postId: cleanPostId,
+        commentId: cleanCommentId,
+        fromUid: cleanFromUid,
+        toUid: cleanToUid,
+        click_action: "FLUTTER_NOTIFICATION_CLICK",
+      },
+    });
+  } catch (error) {
+    console.warn("interaction push failed", {
+      toUid: cleanToUid,
+      type: cleanType,
+      fromUid: cleanFromUid,
+      error: error.message,
+    });
+    return null;
+  }
+}
+
+async function hasActiveCallBetweenUsers({ callerUid, receiverUid, callId = "" }) {
+  const cleanCallerUid = cleanText(callerUid);
+  const cleanReceiverUid = cleanText(receiverUid);
+  const cleanCallId = cleanText(callId);
+
+  if (!cleanCallerUid || !cleanReceiverUid) return false;
+
+  const snap = await db
+    .collection("calls")
+    .where("callerUid", "==", cleanCallerUid)
+    .where("receiverUid", "==", cleanReceiverUid)
+    .limit(10)
+    .get();
+
+  const activeStatuses = new Set(["ringing", "accepted", "connecting"]);
+
+  for (const doc of snap.docs) {
+    if (cleanCallId && doc.id === cleanCallId) continue;
+
+    const data = doc.data() || {};
+    const status = cleanText(data.status).toLowerCase();
+
+    if (!activeStatuses.has(status)) continue;
+
+    const createdAt = data.createdAt;
+    if (createdAt && typeof createdAt.toDate === "function") {
+      const ageMs = Date.now() - createdAt.toDate().getTime();
+      if (ageMs > 90 * 1000 && status === "ringing") continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
 async function deleteNotificationDoc({ toUid, notificationId }) {
   const cleanToUid = cleanText(toUid);
   const cleanNotificationId = cleanText(notificationId);
@@ -1175,6 +1291,20 @@ app.post("/send-call", verifyUser, async (req, res) => {
       });
     }
 
+    const hasDuplicateActiveCall = await hasActiveCallBetweenUsers({
+      callerUid,
+      receiverUid,
+      callId,
+    });
+
+    if (hasDuplicateActiveCall) {
+      return res.status(409).json({
+        ok: false,
+        duplicate: true,
+        error: "There is already an active call between these users",
+      });
+    }
+
     const fallbackCallerName = cleanText(req.body.callerName);
     const callerName = fallbackCallerName || (await getUserTitle(callerUid));
 
@@ -1363,6 +1493,13 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
           text: "أعجب بمنشورك",
           notificationId,
         });
+        await sendInteractionPush({
+          toUid: result.postOwnerUid,
+          type: "like",
+          fromUid: actorUid,
+          postId,
+          notificationId,
+        });
       } else {
         await deleteNotificationDoc({
           toUid: result.postOwnerUid,
@@ -1452,6 +1589,8 @@ app.post("/add-comment", verifyUser, async (req, res) => {
     });
 
     if (result.postOwnerUid && result.postOwnerUid !== actorUid) {
+      const notificationId = commentNotificationId(postId, result.commentId);
+
       await addNotificationDoc({
         toUid: result.postOwnerUid,
         type: "comment",
@@ -1459,7 +1598,17 @@ app.post("/add-comment", verifyUser, async (req, res) => {
         postId,
         commentId: result.commentId,
         text: "علّق على منشورك",
-        notificationId: commentNotificationId(postId, result.commentId),
+        notificationId,
+      });
+
+      await sendInteractionPush({
+        toUid: result.postOwnerUid,
+        type: "comment",
+        fromUid: actorUid,
+        postId,
+        commentId: result.commentId,
+        notificationId,
+        text,
       });
     }
 
@@ -1635,6 +1784,14 @@ app.post("/toggle-comment-like", verifyUser, async (req, res) => {
           text: "أعجب بتعليقك",
           notificationId,
         });
+        await sendInteractionPush({
+          toUid: result.commentOwnerUid,
+          type: "comment_like",
+          fromUid: actorUid,
+          postId,
+          commentId,
+          notificationId,
+        });
       } else {
         await deleteNotificationDoc({
           toUid: result.commentOwnerUid,
@@ -1747,6 +1904,12 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
         fromUid: meUid,
         postId: "",
         text: "بدأ بمتابعتك",
+        notificationId,
+      });
+      await sendInteractionPush({
+        toUid: otherUid,
+        type: "follow",
+        fromUid: meUid,
         notificationId,
       });
     } else {
