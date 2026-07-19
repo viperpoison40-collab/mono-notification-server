@@ -176,6 +176,121 @@ async function getUserTokens(uid) {
   return Array.from(tokens);
 }
 
+
+const DEFAULT_NOTIFICATION_PREFERENCES = {
+  enabled: true,
+  messages: true,
+  calls: true,
+  likes: true,
+  comments: true,
+  commentLikes: true,
+  follows: true,
+  stories: true,
+  general: true,
+};
+
+function notificationPreferenceKey(type = "") {
+  const cleanType = cleanText(type).toLowerCase();
+
+  if (cleanType === "message" || cleanType === "messages") return "messages";
+  if (
+    cleanType === "call" ||
+    cleanType === "calls" ||
+    cleanType === "incoming_call" ||
+    cleanType === "missed_call"
+  ) {
+    return "calls";
+  }
+  if (cleanType === "like" || cleanType === "likes") return "likes";
+  if (cleanType === "comment" || cleanType === "comments") return "comments";
+  if (
+    cleanType === "comment_like" ||
+    cleanType === "comment_likes" ||
+    cleanType === "commentlikes" ||
+    cleanType === "commentLikes"
+  ) {
+    return "commentLikes";
+  }
+  if (
+    cleanType === "follow" ||
+    cleanType === "new_follow" ||
+    cleanType === "follows"
+  ) {
+    return "follows";
+  }
+  if (cleanType === "story" || cleanType === "stories") return "stories";
+
+  return "general";
+}
+
+function notificationTypeFromData(data = {}) {
+  const notificationType = cleanText(data.notificationType).toLowerCase();
+  if (notificationType) return notificationType;
+
+  const type = cleanText(data.type).toLowerCase();
+  if (type) return type;
+
+  return "general";
+}
+
+async function getNotificationPreferences(uid) {
+  const cleanUid = cleanText(uid);
+  if (!cleanUid) return { ...DEFAULT_NOTIFICATION_PREFERENCES };
+
+  try {
+    const snap = await db
+      .collection("users")
+      .doc(cleanUid)
+      .collection("settings")
+      .doc("notificationPreferences")
+      .get();
+
+    if (!snap.exists) {
+      return { ...DEFAULT_NOTIFICATION_PREFERENCES };
+    }
+
+    const data = snap.data() || {};
+
+    return {
+      ...DEFAULT_NOTIFICATION_PREFERENCES,
+      ...data,
+    };
+  } catch (error) {
+    console.warn("Failed to read notification preferences", {
+      uid: cleanUid,
+      error: error.message,
+    });
+
+    return { ...DEFAULT_NOTIFICATION_PREFERENCES };
+  }
+}
+
+async function isNotificationTypeEnabled(uid, type) {
+  const cleanUid = cleanText(uid);
+  if (!cleanUid) return false;
+
+  const prefs = await getNotificationPreferences(cleanUid);
+  const key = notificationPreferenceKey(type);
+
+  if (prefs.enabled === false) return false;
+  if (prefs[key] === false) return false;
+
+  return true;
+}
+
+async function skipNotificationResult({ uid, type, reason = "notification-disabled" }) {
+  return {
+    ok: true,
+    sent: 0,
+    failed: 0,
+    skipped: true,
+    reason,
+    uid: cleanText(uid),
+    notificationType: notificationPreferenceKey(type),
+  };
+}
+
+
 async function deleteBadTokens(uid, badTokens) {
   if (!uid || badTokens.length === 0) return;
 
@@ -225,6 +340,16 @@ async function sendPushToUser({
   collapseKey = "mono_general",
   tag = "mono_general",
 }) {
+  const notificationType = notificationTypeFromData(data);
+  const allowed = await isNotificationTypeEnabled(uid, notificationType);
+
+  if (!allowed) {
+    return skipNotificationResult({
+      uid,
+      type: notificationType,
+    });
+  }
+
   const tokens = await getUserTokens(uid);
 
   if (tokens.length === 0) {
@@ -273,6 +398,16 @@ async function sendDataOnlyPushToUser({
   data = {},
   collapseKey = "mono_data",
 }) {
+  const notificationType = notificationTypeFromData(data);
+  const allowed = await isNotificationTypeEnabled(uid, notificationType);
+
+  if (!allowed) {
+    return skipNotificationResult({
+      uid,
+      type: notificationType,
+    });
+  }
+
   const tokens = await getUserTokens(uid);
 
   if (tokens.length === 0) {
@@ -347,6 +482,9 @@ async function addNotificationDoc({
 
   if (!cleanToUid || !cleanType || !cleanFromUid) return;
   if (cleanToUid === cleanFromUid) return;
+
+  const allowed = await isNotificationTypeEnabled(cleanToUid, cleanType);
+  if (!allowed) return;
 
   const ref = cleanNotificationId
     ? db
@@ -1248,6 +1386,7 @@ app.post("/send-message", verifyUser, async (req, res) => {
       tag: `chat_${convoId}`,
       data: {
         type: "message",
+        notificationType: "message",
         convoId,
         messageId,
         fromUid: senderUid,
@@ -1313,6 +1452,7 @@ app.post("/send-call", verifyUser, async (req, res) => {
       collapseKey: `call_${callId}`,
       data: {
         type: "incoming_call",
+        notificationType: "call",
         callId,
         conversationId,
         convoId: conversationId,
