@@ -28,10 +28,28 @@ test("sensitive user actions have authenticated rate limits", () => {
     "send_message",
     "send_call",
     "send_notification",
+    "ad_event",
     "delete_imagekit_file",
   ]) {
     assert.ok(source.includes(`secureAction("${action}"`), `Missing ${action}`);
   }
+});
+
+test("ad metrics are validated and written only by the backend", () => {
+  const routeStart = source.indexOf('app.post(\n  "/ads/event"');
+  const routeEnd = source.indexOf('app.post("/toggle-like"', routeStart);
+  const route = source.slice(routeStart, routeEnd);
+
+  assert.ok(routeStart >= 0, "Missing /ads/event endpoint");
+  assert.match(route, /verifyUser/);
+  assert.match(route, /secureAction\("ad_event"/);
+  assert.match(route, /paymentStatus !== "paid"/);
+  assert.match(route, /status !== "running"/);
+  assert.match(route, /ownerUid === viewerUid/);
+  assert.match(route, /impression-required-before-click/);
+  assert.match(route, /tx\.create\(eventRef/);
+  assert.match(route, /totalImpressions: nextImpressions/);
+  assert.match(route, /totalClicks: nextClicks/);
 });
 
 test("message and call pushes verify server-side resources", () => {

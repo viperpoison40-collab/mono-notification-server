@@ -2198,6 +2198,181 @@ app.post(
 },
 );
 
+const AD_EVENT_PLACEMENTS = new Set([
+  "home_feed",
+  "reels",
+  "stories",
+  "explore",
+]);
+
+function timestampMillis(value) {
+  if (value && typeof value.toMillis === "function") return value.toMillis();
+  return 0;
+}
+
+app.post(
+  "/ads/event",
+  verifyUser,
+  secureAction("ad_event", 120, 3600, { messaging: false }),
+  async (req, res) => {
+    try {
+      const viewerUid = req.user.uid;
+      const adId = cleanText(req.body.adId);
+      const eventType = cleanText(req.body.eventType).toLowerCase();
+      const requestedPlacement = cleanText(req.body.placement).toLowerCase();
+
+      if (
+        !isSafeDocumentId(adId) ||
+        !["impression", "click"].includes(eventType) ||
+        !AD_EVENT_PLACEMENTS.has(requestedPlacement)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid ad event",
+          requestId: req.requestId,
+        });
+      }
+
+      const now = Date.now();
+      const day = new Date(now).toISOString().slice(0, 10).replaceAll("-", "");
+      const impressionSlot = Math.floor(
+        new Date(now).getUTCHours() / 8,
+      );
+      const adRef = db.collection("ads").doc(adId);
+      const impressionRef = adRef
+        .collection("impressions")
+        .doc(`${viewerUid}_${day}_${impressionSlot}`);
+      const eventRef = eventType === "impression"
+        ? impressionRef
+        : adRef.collection("clicks").doc(`${viewerUid}_${day}`);
+
+      const result = await db.runTransaction(async (tx) => {
+        const adSnap = await tx.get(adRef);
+        if (!adSnap.exists) {
+          const error = new Error("ad-not-found");
+          error.statusCode = 404;
+          throw error;
+        }
+
+        const ad = adSnap.data() || {};
+        const status = cleanText(ad.status).toLowerCase();
+        const paymentStatus = cleanText(ad.paymentStatus).toLowerCase();
+        const placement = cleanText(ad.placement).toLowerCase();
+        const ownerUid = cleanText(ad.ownerUid);
+        const startsAt = timestampMillis(ad.startsAt);
+        const endsAt = timestampMillis(ad.endsAt);
+        const totalImpressions = Math.max(0, Number(ad.totalImpressions || 0));
+        const totalClicks = Math.max(0, Number(ad.totalClicks || 0));
+        const maxImpressions = Math.max(0, Number(ad.maxImpressions || 0));
+        const maxClicks = Math.max(0, Number(ad.maxClicks || 0));
+
+        if (
+          status !== "running" ||
+          paymentStatus !== "paid" ||
+          placement !== requestedPlacement ||
+          ownerUid === viewerUid ||
+          (startsAt > 0 && startsAt > now)
+        ) {
+          const error = new Error("ad-event-not-allowed");
+          error.statusCode = 403;
+          throw error;
+        }
+
+        if (
+          (endsAt > 0 && endsAt <= now) ||
+          (maxImpressions > 0 && totalImpressions >= maxImpressions) ||
+          (maxClicks > 0 && totalClicks >= maxClicks)
+        ) {
+          tx.set(
+            adRef,
+            {
+              status: "completed",
+              completedAt: FieldValue.serverTimestamp(),
+              completionReason: "delivery_limit",
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+          return { recorded: false, duplicate: false, completed: true };
+        }
+
+        const eventSnap = await tx.get(eventRef);
+        if (eventSnap.exists) {
+          return { recorded: false, duplicate: true, completed: false };
+        }
+
+        if (eventType === "click") {
+          const impressionSnap = await tx.get(impressionRef);
+          if (!impressionSnap.exists) {
+            const error = new Error("impression-required-before-click");
+            error.statusCode = 409;
+            throw error;
+          }
+        }
+
+        const nextImpressions = totalImpressions +
+          (eventType === "impression" ? 1 : 0);
+        const nextClicks = totalClicks + (eventType === "click" ? 1 : 0);
+        const completed =
+          (maxImpressions > 0 && nextImpressions >= maxImpressions) ||
+          (maxClicks > 0 && nextClicks >= maxClicks);
+
+        tx.create(eventRef, {
+          adId,
+          viewerUid,
+          placement,
+          eventType,
+          day,
+          impressionSlot,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        tx.set(
+          adRef,
+          {
+            ...(eventType === "impression"
+              ? {
+                  totalImpressions: nextImpressions,
+                  lastImpressionAt: FieldValue.serverTimestamp(),
+                }
+              : {
+                  totalClicks: nextClicks,
+                  lastClickAt: FieldValue.serverTimestamp(),
+                }),
+            ...(completed
+              ? {
+                  status: "completed",
+                  completedAt: FieldValue.serverTimestamp(),
+                  completionReason: eventType === "impression"
+                    ? "max_impressions"
+                    : "max_clicks",
+                }
+              : {}),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return { recorded: true, duplicate: false, completed };
+      });
+
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      console.error("ads-event error", {
+        requestId: req.requestId,
+        code: error.message,
+      });
+      return res.status(error.statusCode || 500).json({
+        ok: false,
+        error:
+          error.statusCode && error.statusCode < 500
+            ? error.message
+            : "Server error",
+        requestId: req.requestId,
+      });
+    }
+  },
+);
+
 app.post("/toggle-like", verifyUser, async (req, res) => {
   try {
     const actorUid = req.user.uid;
