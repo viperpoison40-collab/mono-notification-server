@@ -206,10 +206,15 @@ async function enforceUserRateLimit(uid, action, limit, windowSeconds) {
   });
 }
 
-function secureAction(action, limit, windowSeconds = 60) {
+function secureAction(
+  action,
+  limit,
+  windowSeconds = 60,
+  { messaging = true } = {},
+) {
   return async (req, res, next) => {
     try {
-      await requireActiveUser(req.user.uid, { messaging: true });
+      await requireActiveUser(req.user.uid, { messaging });
       await enforceUserRateLimit(
         req.user.uid,
         action,
@@ -847,6 +852,14 @@ function imageKitFileIdsFromStory(storyData = {}) {
 async function userOwnsImageKitFile(uid, fileId) {
   const cleanUid = cleanText(uid);
   const cleanFileId = cleanText(fileId);
+  const assetSnap = await db.collection("_mediaAssets").doc(cleanFileId).get();
+  if (
+    assetSnap.exists &&
+    cleanText(assetSnap.data()?.ownerUid) === cleanUid &&
+    cleanText(assetSnap.data()?.status) !== "deleted"
+  ) {
+    return true;
+  }
   const candidates = [
     ["posts", "mediaFileId"],
     ["posts", "thumbnailFileId"],
@@ -1509,19 +1522,181 @@ function getImageKitPrivateKey() {
   return "";
 }
 
-function maskSecret(value) {
-  const text = cleanText(value);
-  if (!text) return "";
-  if (text.length <= 10) return "***";
-  return `${text.substring(0, 8)}...${text.substring(text.length - 4)}`;
+const MEDIA_LIMITS = Object.freeze({
+  image: { maxBytes: 10 * 1024 * 1024, dailyCount: 60 },
+  video: { maxBytes: 250 * 1024 * 1024, dailyCount: 12 },
+  audio: { maxBytes: 25 * 1024 * 1024, dailyCount: 60 },
+});
+const configuredMediaDailyBytes = Number(
+  process.env.IMAGEKIT_DAILY_BYTES_PER_USER,
+);
+const MEDIA_DAILY_BYTES =
+  Number.isSafeInteger(configuredMediaDailyBytes) &&
+  configuredMediaDailyBytes > 0
+    ? configuredMediaDailyBytes
+    : 750 * 1024 * 1024;
+const MEDIA_SESSION_SECONDS = 5 * 60;
+
+function mediaDayKey() {
+  return new Date().toISOString().slice(0, 10).replaceAll("-", "");
 }
 
-app.get(
+function safeMediaExtension(value) {
+  const ext = cleanText(value).toLowerCase().replace(/[^a-z0-9]/g, "");
+  return ext && ext.length <= 8 ? ext : "";
+}
+
+function mediaExtensionAllowed(type, ext) {
+  const allowed = {
+    image: new Set(["jpg", "jpeg", "png", "webp", "gif"]),
+    video: new Set(["mp4", "mov", "m4v", "webm", "mkv"]),
+    audio: new Set(["m4a", "aac", "mp3", "wav", "webm", "ogg", "opus"]),
+  };
+  return allowed[type]?.has(ext) === true;
+}
+
+async function validateMediaFolder(uid, requestedFolder) {
+  const folder = cleanText(requestedFolder)
+    .replaceAll("\\", "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (
+    !folder ||
+    folder.length > 180 ||
+    folder.includes("..") ||
+    !/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(folder)
+  ) {
+    return "";
+  }
+
+  const escapedUid = cleanText(uid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const ownedPatterns = [
+    new RegExp(`^avatars/${escapedUid}$`),
+    new RegExp(`^covers/${escapedUid}$`),
+    new RegExp(`^posts/(images|videos|thumbnails)/${escapedUid}$`),
+    new RegExp(`^stories/(images|videos)/${escapedUid}$`),
+    new RegExp(`^ads/${escapedUid}(/payments)?$`),
+  ];
+  if (ownedPatterns.some((pattern) => pattern.test(folder))) return folder;
+
+  const chatMatch = /^chats\/([^/]+)\/(media|voice)$/.exec(folder);
+  if (chatMatch && isSafeDocumentId(chatMatch[1])) {
+    const snap = await db.collection("conversations").doc(chatMatch[1]).get();
+    const participants = uniqueCleanStrings(snap.data()?.participants || []);
+    if (snap.exists && participants.includes(uid)) return folder;
+  }
+  return "";
+}
+
+async function reserveMediaUpload({ uid, type, bytes, folder, extension }) {
+  const uploadId = randomUUID();
+  const day = mediaDayKey();
+  const quotaRef = db.collection("_mediaUploadQuotas").doc(`${uid}_${day}`);
+  const sessionRef = db.collection("_mediaUploadSessions").doc(uploadId);
+  const expiresAt = Timestamp.fromMillis(
+    Date.now() + MEDIA_SESSION_SECONDS * 1000,
+  );
+
+  await db.runTransaction(async (tx) => {
+    const quotaSnap = await tx.get(quotaRef);
+    const quota = quotaSnap.data() || {};
+    const totalBytes = Number(quota.totalBytes || 0);
+    const typeCount = Number(quota[`${type}Count`] || 0);
+    if (
+      totalBytes + bytes > MEDIA_DAILY_BYTES ||
+      typeCount >= MEDIA_LIMITS[type].dailyCount
+    ) {
+      const error = new Error("media-daily-quota-exceeded");
+      error.statusCode = 429;
+      throw error;
+    }
+
+    tx.set(
+      quotaRef,
+      {
+        uid,
+        day,
+        totalBytes: totalBytes + bytes,
+        [`${type}Count`]: typeCount + 1,
+        updatedAt: FieldValue.serverTimestamp(),
+        expiresAt: Timestamp.fromMillis(Date.now() + 3 * 24 * 3600 * 1000),
+      },
+      { merge: true },
+    );
+    tx.create(sessionRef, {
+      uploadId,
+      ownerUid: uid,
+      type,
+      expectedBytes: bytes,
+      folder,
+      extension,
+      fileName: `${uploadId}.${extension}`,
+      status: "reserved",
+      day,
+      createdAt: FieldValue.serverTimestamp(),
+      expiresAt,
+    });
+  });
+
+  return { uploadId, sessionRef, expiresAt };
+}
+
+async function getImageKitFileDetails(fileId) {
+  const privateKey = getImageKitPrivateKey();
+  const response = await fetch(
+    `https://api.imagekit.io/v1/files/${encodeURIComponent(fileId)}/details`,
+    {
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${privateKey}:`).toString(
+          "base64",
+        )}`,
+      },
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`imagekit-details-failed:${response.status}`);
+  }
+  return response.json();
+}
+
+async function releaseMediaReservation(uploadId, uid) {
+  const sessionRef = db.collection("_mediaUploadSessions").doc(uploadId);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(sessionRef);
+    if (!snap.exists) return;
+    const data = snap.data() || {};
+    if (
+      cleanText(data.ownerUid) !== uid ||
+      cleanText(data.status) !== "reserved"
+    ) {
+      return;
+    }
+    const type = cleanText(data.type);
+    const quotaRef = db
+      .collection("_mediaUploadQuotas")
+      .doc(`${uid}_${cleanText(data.day)}`);
+    tx.set(
+      quotaRef,
+      {
+        totalBytes: FieldValue.increment(-Number(data.expectedBytes || 0)),
+        [`${type}Count`]: FieldValue.increment(-1),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    tx.update(sessionRef, {
+      status: "cancelled",
+      cancelledAt: FieldValue.serverTimestamp(),
+    });
+  });
+}
+
+app.post(
   "/imagekit-upload-auth",
   verifyUser,
-  secureAction("imagekit_auth", 20, 3600),
+  secureAction("imagekit_auth", 80, 3600, { messaging: false }),
   async (req, res) => {
   try {
+    const uid = req.user.uid;
     const privateKey = getImageKitPrivateKey();
 
     if (!privateKey) {
@@ -1543,9 +1718,7 @@ app.get(
     }
 
     if (!privateKey.startsWith("private_")) {
-      console.error("ImageKit upload auth failed: invalid private key format", {
-        privateKeyPreview: maskSecret(privateKey),
-      });
+      console.error("ImageKit upload auth failed: invalid private key format");
 
       return res.status(503).json({
         ok: false,
@@ -1555,8 +1728,35 @@ app.get(
       });
     }
 
+    const type = cleanText(req.body.type).toLowerCase();
+    const bytes = Number(req.body.bytes || 0);
+    const extension = safeMediaExtension(req.body.extension);
+    const folder = await validateMediaFolder(uid, req.body.folder);
+    const limits = MEDIA_LIMITS[type];
+    if (
+      !limits ||
+      !Number.isSafeInteger(bytes) ||
+      bytes <= 0 ||
+      bytes > limits.maxBytes ||
+      !mediaExtensionAllowed(type, extension) ||
+      !folder
+    ) {
+      return res.status(400).json({
+        ok: false,
+        code: "invalid_upload_request",
+        error: "Invalid upload type, size, extension, or folder",
+      });
+    }
+
+    const reservation = await reserveMediaUpload({
+      uid,
+      type,
+      bytes,
+      folder,
+      extension,
+    });
     const token = randomBytes(24).toString("hex");
-    const expire = Math.floor(Date.now() / 1000) + 10 * 60;
+    const expire = Math.floor(reservation.expiresAt.toMillis() / 1000);
 
     const signature = createHmac("sha1", privateKey)
       .update(`${token}${expire}`)
@@ -1567,18 +1767,143 @@ app.get(
       token,
       expire,
       signature,
+      uploadId: reservation.uploadId,
+      folder: `/${folder}`,
+      fileName: `${reservation.uploadId}.${extension}`,
+      maxBytes: limits.maxBytes,
     });
   } catch (error) {
     console.error("imagekit-upload-auth error", error);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       ok: false,
-      code: "imagekit_upload_auth_failed",
-      error: "Server error",
+      code:
+        error.message === "media-daily-quota-exceeded"
+          ? "media_daily_quota_exceeded"
+          : "imagekit_upload_auth_failed",
+      error:
+        error.message === "media-daily-quota-exceeded"
+          ? "Daily media upload quota exceeded"
+          : "Server error",
       requestId: req.requestId,
     });
   }
 },
+);
+
+app.post(
+  "/imagekit-upload-complete",
+  verifyUser,
+  secureAction("imagekit_complete", 100, 3600, { messaging: false }),
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
+      const uploadId = cleanText(req.body.uploadId);
+      const fileId = cleanText(req.body.fileId);
+      if (!isSafeDocumentId(uploadId) || !isSafeDocumentId(fileId)) {
+        return res.status(400).json({ ok: false, error: "Invalid upload" });
+      }
+      const sessionRef = db.collection("_mediaUploadSessions").doc(uploadId);
+      const sessionSnap = await sessionRef.get();
+      const session = sessionSnap.data() || {};
+      if (
+        !sessionSnap.exists ||
+        cleanText(session.ownerUid) !== uid ||
+        cleanText(session.status) !== "reserved" ||
+        session.expiresAt?.toMillis?.() < Date.now()
+      ) {
+        return res.status(403).json({ ok: false, error: "Upload not owned" });
+      }
+
+      const details = await getImageKitFileDetails(fileId);
+      const expectedPath = `/${cleanText(session.folder)}/${cleanText(
+        session.fileName,
+      )}`;
+      const actualPath = cleanText(details.filePath);
+      const actualBytes = Number(details.size || 0);
+      if (
+        actualPath !== expectedPath ||
+        actualBytes <= 0 ||
+        actualBytes > Number(session.expectedBytes || 0)
+      ) {
+        await deleteImageKitFile(fileId).catch(() => {});
+        await releaseMediaReservation(uploadId, uid);
+        return res.status(400).json({
+          ok: false,
+          error: "Uploaded file does not match its reservation",
+        });
+      }
+
+      const assetRef = db.collection("_mediaAssets").doc(fileId);
+      await db.runTransaction(async (tx) => {
+        const freshSession = await tx.get(sessionRef);
+        if (cleanText(freshSession.data()?.status) !== "reserved") {
+          const error = new Error("upload-already-finalized");
+          error.statusCode = 409;
+          throw error;
+        }
+        tx.create(assetRef, {
+          fileId,
+          uploadId,
+          ownerUid: uid,
+          type: cleanText(session.type),
+          bytes: actualBytes,
+          filePath: actualPath,
+          url: cleanText(details.url || req.body.url),
+          status: "active",
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        tx.update(sessionRef, {
+          status: "completed",
+          fileId,
+          actualBytes,
+          completedAt: FieldValue.serverTimestamp(),
+        });
+      });
+      return res.json({ ok: true, fileId, owned: true });
+    } catch (error) {
+      console.error("imagekit-upload-complete error", error);
+      return res.status(error.statusCode || 500).json({
+        ok: false,
+        error: "Could not verify uploaded file",
+        requestId: req.requestId,
+      });
+    }
+  },
+);
+
+app.post(
+  "/imagekit-upload-cancel",
+  verifyUser,
+  secureAction("imagekit_cancel", 100, 3600, { messaging: false }),
+  async (req, res) => {
+    const uid = req.user.uid;
+    const uploadId = cleanText(req.body.uploadId);
+    const fileId = cleanText(req.body.fileId);
+    if (!isSafeDocumentId(uploadId)) {
+      return res.status(400).json({ ok: false, error: "Invalid uploadId" });
+    }
+    if (isSafeDocumentId(fileId)) {
+      const session = (
+        await db.collection("_mediaUploadSessions").doc(uploadId).get()
+      ).data();
+      if (
+        cleanText(session?.ownerUid) === uid &&
+        cleanText(session?.fileName) &&
+        cleanText(session?.folder)
+      ) {
+        const details = await getImageKitFileDetails(fileId).catch(() => null);
+        const expected = `/${cleanText(session.folder)}/${cleanText(
+          session.fileName,
+        )}`;
+        if (cleanText(details?.filePath) === expected) {
+          await deleteImageKitFile(fileId).catch(() => {});
+        }
+      }
+    }
+    await releaseMediaReservation(uploadId, uid);
+    return res.json({ ok: true, cancelled: true });
+  },
 );
 app.post(
   "/send-message",
@@ -3195,7 +3520,7 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
 app.post(
   "/delete-imagekit-file",
   verifyUser,
-  secureAction("delete_imagekit_file", 20, 3600),
+  secureAction("delete_imagekit_file", 20, 3600, { messaging: false }),
   async (req, res) => {
   try {
     const actorUid = req.user.uid;
@@ -3218,6 +3543,14 @@ app.post(
     }
 
     const result = await deleteImageKitFile(fileId);
+    await db.collection("_mediaAssets").doc(fileId).set(
+      {
+        status: "deleted",
+        deletedBy: actorUid,
+        deletedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
 
     return res.json({
       ok: true,
