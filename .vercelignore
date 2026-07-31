@@ -1,5 +1,6 @@
 .env
-node_modules
-.DS_Store
+.env.*
 serviceAccountKey.json
+node_modules
 *.zip
+patch_backups

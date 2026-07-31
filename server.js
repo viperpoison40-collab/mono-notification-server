@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const fs = require("fs");
 const { createHmac, randomBytes } = require("crypto");
 
 const app = express();
@@ -10,13 +11,34 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-const serviceAccount = process.env.FIREBASE_PRIVATE_KEY
+const localServiceAccountPath = "./serviceAccountKey.json";
+const hasEnvironmentCredential =
+  cleanText(process.env.FIREBASE_PROJECT_ID) &&
+  cleanText(process.env.FIREBASE_CLIENT_EMAIL) &&
+  cleanText(process.env.FIREBASE_PRIVATE_KEY);
+
+if (
+  !hasEnvironmentCredential &&
+  (process.env.VERCEL || process.env.NODE_ENV === "production")
+) {
+  throw new Error(
+    "Firebase Admin environment variables are required in production.",
+  );
+}
+
+const serviceAccount = hasEnvironmentCredential
   ? {
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
       privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
     }
-  : require("./serviceAccountKey.json");
+  : fs.existsSync(localServiceAccountPath)
+    ? require(localServiceAccountPath)
+    : null;
+
+if (!serviceAccount) {
+  throw new Error("Firebase Admin credentials are not configured.");
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -101,8 +123,18 @@ async function isAdminUser(uid, email = "") {
     const snap = await db.collection("users").doc(cleanUid).get();
     const data = snap.data() || {};
     const role = cleanText(data.role).toLowerCase();
+    const roles = Array.isArray(data.roles)
+      ? data.roles.map((value) => cleanText(value).toLowerCase())
+      : [];
 
-    return data.isAdmin === true || role === "admin" || role === "owner";
+    return (
+      data.isAdmin === true ||
+      data.admin === true ||
+      ["admin", "owner", "moderator"].includes(role) ||
+      roles.some((value) =>
+        ["admin", "owner", "moderator"].includes(value),
+      )
+    );
   } catch (error) {
     console.warn("Failed to check admin user", cleanUid, error.message);
     return false;
@@ -2074,6 +2106,624 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
     });
   }
 });
+
+function boundedInt(value, fallback, min, max) {
+  const parsed = Number.parseInt(value, 10);
+  const number = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.max(min, Math.min(max, number));
+}
+
+function cleanCurrency(value) {
+  const currency = cleanText(value).toUpperCase();
+  return (currency || "IQD").substring(0, 6);
+}
+
+function cleanPaymentAccountType(value) {
+  const allowed = new Set([
+    "zain_cash",
+    "asia_hawala",
+    "fastpay",
+    "bank_transfer",
+    "cash",
+    "other",
+  ]);
+  const type = cleanText(value).toLowerCase();
+  return allowed.has(type) ? type : "zain_cash";
+}
+
+async function writeAdminLog(adminUid, action, payload = {}, result = {}) {
+  await db.collection("adminLogs").add({
+    action,
+    adminUid,
+    targetUid: cleanText(payload.targetUid),
+    targetId: cleanText(
+      payload.postId ||
+        payload.reportId ||
+        payload.adId ||
+        payload.packageId ||
+        payload.accountId,
+    ),
+    reason: cleanText(payload.reason || payload.adminNote || payload.note),
+    result,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function notifyAdOwner(adId, adminUid, type, text) {
+  const snap = await db.collection("ads").doc(adId).get();
+  const ownerUid = cleanText(snap.data()?.ownerUid);
+  if (!ownerUid) return;
+
+  const notificationId = `${type}_${adId}`;
+  await addNotificationDoc({
+    toUid: ownerUid,
+    type,
+    fromUid: adminUid,
+    text,
+    notificationId,
+  });
+
+  await sendPushToUser({
+    uid: ownerUid,
+    title: "MONO Ads",
+    body: text,
+    tag: notificationId,
+    collapseKey: `ad_${adId}`,
+    data: {
+      type,
+      notificationType: "general",
+      notificationId,
+      adId,
+      fromUid: adminUid,
+      toUid: ownerUid,
+    },
+  }).catch((error) => {
+    console.warn("Admin ad notification failed", adId, error.message);
+  });
+}
+
+async function searchAdminUsers(query) {
+  const cleanQuery = cleanText(query).toLowerCase();
+  const users = new Map();
+
+  const addSnapshot = (snap) => {
+    snap.docs.forEach((doc) => {
+      const data = doc.data() || {};
+      users.set(doc.id, {
+        uid: doc.id,
+        username: cleanText(data.username),
+        displayName: cleanText(data.displayName),
+        avatarUrl: cleanText(data.avatarUrl),
+        status: cleanText(data.status) || "active",
+        deleted: data.deleted === true,
+        isDeleted: data.isDeleted === true,
+        banned: data.banned === true,
+        isBanned: data.isBanned === true,
+        canMessage: data.canMessage !== false,
+        followersCount: Number(data.followersCount || 0),
+        followingCount: Number(data.followingCount || 0),
+        postsCount: Number(data.postsCount || 0),
+      });
+    });
+  };
+
+  if (!cleanQuery) {
+    addSnapshot(
+      await db.collection("users").orderBy("createdAt", "desc").limit(50).get(),
+    );
+    return [...users.values()];
+  }
+
+  const exact = await db.collection("users").doc(cleanText(query)).get();
+  if (exact.exists) addSnapshot({ docs: [exact] });
+
+  const end = `${cleanQuery}\uf8ff`;
+  for (const field of ["usernameLower", "displayNameLower", "emailLower"]) {
+    try {
+      addSnapshot(
+        await db
+          .collection("users")
+          .orderBy(field)
+          .startAt(cleanQuery)
+          .endAt(end)
+          .limit(25)
+          .get(),
+      );
+    } catch (error) {
+      console.warn("Admin user search field failed", field, error.message);
+    }
+  }
+
+  return [...users.values()];
+}
+
+app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
+  const adminUid = req.user.uid;
+  const payload = req.body || {};
+  const action = cleanText(payload.action).toLowerCase();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  try {
+    let result = {};
+
+    if (action === "search_users") {
+      return res.json({
+        ok: true,
+        users: await searchAdminUsers(payload.query),
+      });
+    }
+
+    if (
+      [
+        "ban_user",
+        "unban_user",
+        "soft_delete_user",
+        "restore_user",
+        "disable_messaging",
+        "delete_user_posts",
+        "delete_user_stories",
+        "delete_user_conversations",
+      ].includes(action)
+    ) {
+      const targetUid = cleanText(payload.targetUid);
+      if (!targetUid) {
+        return res.status(400).json({ ok: false, error: "targetUid is required" });
+      }
+      if (
+        targetUid === adminUid &&
+        ["ban_user", "soft_delete_user"].includes(action)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Admin cannot disable own account",
+        });
+      }
+
+      const targetRef = db.collection("users").doc(targetUid);
+
+      if (action === "ban_user") {
+        await targetRef.set(
+          {
+            status: "banned",
+            banned: true,
+            isBanned: true,
+            deleted: false,
+            isDeleted: false,
+            canMessage: false,
+            banReason: cleanText(payload.reason),
+            bannedBy: adminUid,
+            bannedAt: now,
+            updatedAt: now,
+            lastFcmToken: admin.firestore.FieldValue.delete(),
+            lastFcmTokenUpdatedAt: admin.firestore.FieldValue.delete(),
+          },
+          { merge: true },
+        );
+      } else if (action === "unban_user") {
+        await targetRef.set(
+          {
+            status: "active",
+            banned: false,
+            isBanned: false,
+            canMessage: true,
+            banReason: admin.firestore.FieldValue.delete(),
+            unbannedBy: adminUid,
+            unbannedAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+      } else if (action === "soft_delete_user") {
+        await targetRef.set(
+          {
+            status: "deleted",
+            deleted: true,
+            isDeleted: true,
+            banned: false,
+            isBanned: false,
+            canMessage: false,
+            username: "Deleted user",
+            usernameLower: "deleted user",
+            displayName: "Deleted user",
+            displayNameLower: "deleted user",
+            bio: "",
+            avatarUrl: "",
+            coverPhotoUrl: "",
+            deletedBy: adminUid,
+            deleteReason: cleanText(payload.reason),
+            deletedAt: now,
+            updatedAt: now,
+            lastFcmToken: admin.firestore.FieldValue.delete(),
+            lastFcmTokenUpdatedAt: admin.firestore.FieldValue.delete(),
+          },
+          { merge: true },
+        );
+      } else if (action === "restore_user") {
+        await targetRef.set(
+          {
+            status: "active",
+            deleted: false,
+            isDeleted: false,
+            banned: false,
+            isBanned: false,
+            canMessage: true,
+            restoredBy: adminUid,
+            restoredAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+      } else if (action === "disable_messaging") {
+        await targetRef.set(
+          {
+            canMessage: false,
+            messagingDisabledBy: adminUid,
+            messagingDisabledAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+      } else if (action === "delete_user_posts") {
+        const deleted = await deleteUserPostsCompletely(targetUid);
+        await targetRef.set({ postsCount: 0, updatedAt: now }, { merge: true });
+        result = { deletedCount: deleted.deletedPosts || 0, details: deleted };
+      } else if (action === "delete_user_stories") {
+        const deleted = await deleteUserStoriesCompletely(targetUid);
+        result = {
+          deletedCount: deleted.deletedStories || 0,
+          details: deleted,
+        };
+      } else if (action === "delete_user_conversations") {
+        const deleted = await deleteUserConversationsCompletely(targetUid);
+        result = {
+          deletedCount: deleted.deletedConversations || 0,
+          details: deleted,
+        };
+      }
+    } else if (action === "update_report_status") {
+      const reportId = cleanText(payload.reportId);
+      const status = cleanText(payload.status).toLowerCase();
+      const allowedStatuses = new Set([
+        "open",
+        "reviewing",
+        "dismissed",
+        "action_taken",
+        "resolved",
+      ]);
+      if (!reportId || !allowedStatuses.has(status)) {
+        return res.status(400).json({ ok: false, error: "Invalid report data" });
+      }
+      await db.collection("reports").doc(reportId).set(
+        {
+          status,
+          reviewedBy: adminUid,
+          reviewNote: cleanText(payload.note),
+          reviewedAt: now,
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+    } else if (action === "moderation_delete_post") {
+      const postId = cleanText(payload.postId);
+      const reportId = cleanText(payload.reportId);
+      if (!postId) {
+        return res.status(400).json({ ok: false, error: "postId is required" });
+      }
+      await db.collection("posts").doc(postId).set(
+        {
+          deleted: true,
+          isDeleted: true,
+          moderationDeleted: true,
+          moderationDeletedBy: adminUid,
+          moderationDeletedReason: cleanText(payload.reason),
+          moderationDeletedAt: now,
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+      if (reportId) {
+        await db.collection("reports").doc(reportId).set(
+          {
+            status: "action_taken",
+            reviewedBy: adminUid,
+            reviewNote: cleanText(payload.reason),
+            reviewedAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+      }
+    } else if (action === "seed_ad_defaults") {
+      const defaults = [
+        ["try_1d_1000", "باقة تجربة سريعة", "Quick Trial Package", 1, 1000, 3000, 1],
+        ["starter_3d_5000", "باقة البداية", "Starter Package", 3, 5000, 10000, 2],
+        ["shops_7d_15000", "باقة المحلات", "Local Shops Package", 7, 15000, 25000, 3],
+        ["offers_10d_25000", "باقة العروض والافتتاح", "Offers & Opening Package", 10, 25000, 40000, 4],
+        ["reach_14d_50000", "باقة الانتشار", "Reach Package", 14, 50000, 75000, 5],
+        ["monthly_30d_100000", "باقة الشهر", "Monthly Package", 30, 100000, 140000, 6],
+        ["premium_30d_200000", "باقة الانتشار الكبير", "Premium Reach Package", 30, 200000, 250000, 7],
+      ];
+      const batch = db.batch();
+      defaults.forEach(
+        ([id, nameAr, nameEn, durationDays, maxImpressions, price, sortOrder]) => {
+          batch.set(
+            db.collection("adPackages").doc(id),
+            {
+              packageId: id,
+              nameAr,
+              nameEn,
+              descriptionAr: "",
+              descriptionEn: "",
+              durationDays,
+              maxImpressions,
+              price,
+              currency: "IQD",
+              active: true,
+              sortOrder,
+              createdBy: adminUid,
+              updatedBy: adminUid,
+              createdAt: now,
+              updatedAt: now,
+            },
+            { merge: true },
+          );
+        },
+      );
+      batch.set(
+        db.collection("adPaymentAccounts").doc("zain_cash_default"),
+        {
+          accountId: "zain_cash_default",
+          nameAr: "زين كاش",
+          nameEn: "Zain Cash",
+          type: "zain_cash",
+          accountNumber: "",
+          accountHolderName: "MONO Ads",
+          instructionsAr:
+            "حوّل مبلغ الباقة ثم اكتب اسمك ورقم العملية وارفع صورة الوصل.",
+          instructionsEn:
+            "Transfer the package amount, enter your name and transaction number, then upload the receipt.",
+          currency: "IQD",
+          active: true,
+          sortOrder: 1,
+          createdBy: adminUid,
+          updatedBy: adminUid,
+          createdAt: now,
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+      await batch.commit();
+    } else if (action === "save_ad_package") {
+      const packageRef = cleanText(payload.packageId)
+        ? db.collection("adPackages").doc(cleanText(payload.packageId))
+        : db.collection("adPackages").doc();
+      const creating = !cleanText(payload.packageId);
+      await packageRef.set(
+        {
+          packageId: packageRef.id,
+          nameAr: cleanText(payload.nameAr) || "باقة إعلان",
+          nameEn: cleanText(payload.nameEn) || "Ad Package",
+          descriptionAr: cleanText(payload.descriptionAr),
+          descriptionEn: cleanText(payload.descriptionEn),
+          durationDays: boundedInt(payload.durationDays, 7, 1, 90),
+          maxImpressions: boundedInt(payload.maxImpressions, 1000, 100, 1000000),
+          price: boundedInt(payload.price, 0, 0, 100000000),
+          currency: cleanCurrency(payload.currency),
+          active: payload.active !== false,
+          sortOrder: boundedInt(payload.sortOrder, 100, -10000, 10000),
+          updatedBy: adminUid,
+          updatedAt: now,
+          ...(creating ? { createdBy: adminUid, createdAt: now } : {}),
+        },
+        { merge: true },
+      );
+      result = { id: packageRef.id };
+    } else if (action === "save_ad_payment_account") {
+      const accountRef = cleanText(payload.accountId)
+        ? db.collection("adPaymentAccounts").doc(cleanText(payload.accountId))
+        : db.collection("adPaymentAccounts").doc();
+      const creating = !cleanText(payload.accountId);
+      await accountRef.set(
+        {
+          accountId: accountRef.id,
+          nameAr: cleanText(payload.nameAr) || "وسيلة دفع",
+          nameEn: cleanText(payload.nameEn) || "Payment method",
+          type: cleanPaymentAccountType(payload.type),
+          accountNumber: cleanText(payload.accountNumber),
+          accountHolderName: cleanText(payload.accountHolderName),
+          instructionsAr: cleanText(payload.instructionsAr),
+          instructionsEn: cleanText(payload.instructionsEn),
+          currency: cleanCurrency(payload.currency),
+          active: payload.active !== false,
+          sortOrder: boundedInt(payload.sortOrder, 100, -10000, 10000),
+          updatedBy: adminUid,
+          updatedAt: now,
+          ...(creating ? { createdBy: adminUid, createdAt: now } : {}),
+        },
+        { merge: true },
+      );
+      result = { id: accountRef.id };
+    } else if (
+      [
+        "approve_ad",
+        "reject_ad",
+        "pause_ad",
+        "resume_ad",
+        "approve_ad_payment",
+        "reject_ad_payment",
+      ].includes(action)
+    ) {
+      const adId = cleanText(payload.adId);
+      if (!adId) {
+        return res.status(400).json({ ok: false, error: "adId is required" });
+      }
+
+      const adRef = db.collection("ads").doc(adId);
+      const adSnap = await adRef.get();
+      if (!adSnap.exists) {
+        return res.status(404).json({ ok: false, error: "Ad not found" });
+      }
+
+      const adData = adSnap.data() || {};
+      const note = cleanText(payload.adminNote);
+      let notificationType = "";
+      let notificationText = "";
+
+      if (action === "approve_ad") {
+        const paid = cleanText(adData.paymentStatus).toLowerCase() === "paid";
+        const days = boundedInt(adData.requestedDurationDays, 7, 1, 90);
+        const start = admin.firestore.Timestamp.now();
+        const end = admin.firestore.Timestamp.fromMillis(
+          start.toMillis() + days * 24 * 60 * 60 * 1000,
+        );
+        await adRef.set(
+          {
+            status: paid ? "running" : "approved",
+            reviewStatus: "approved",
+            adminNote: note,
+            reviewedBy: adminUid,
+            reviewedAt: now,
+            approvedAt: now,
+            rejectedAt: null,
+            startsAt: paid ? start : null,
+            endsAt: paid ? end : null,
+            completedAt: null,
+            completionReason: "",
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+        notificationType = paid ? "ad_started" : "ad_approved";
+        notificationText = paid
+          ? "تمت الموافقة على إعلانك وبدأ بالظهور الآن."
+          : "تمت الموافقة على إعلانك، وبانتظار تأكيد الدفع حتى يبدأ بالظهور.";
+      } else if (action === "reject_ad") {
+        if (!note) {
+          return res.status(400).json({
+            ok: false,
+            error: "Rejection reason is required",
+          });
+        }
+        await adRef.set(
+          {
+            status: "rejected",
+            reviewStatus: "rejected",
+            adminNote: note,
+            reviewedBy: adminUid,
+            reviewedAt: now,
+            approvedAt: null,
+            rejectedAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+        notificationType = "ad_rejected";
+        notificationText = `تم رفض إعلانك. السبب: ${note}`;
+      } else if (action === "pause_ad") {
+        await adRef.set(
+          {
+            status: "paused",
+            adminNote: note,
+            reviewedBy: adminUid,
+            reviewedAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+        notificationType = "ad_paused";
+        notificationText = "تم إيقاف إعلانك مؤقتًا من الإدارة.";
+      } else if (action === "resume_ad") {
+        const paid = cleanText(adData.paymentStatus).toLowerCase() === "paid";
+        await adRef.set(
+          {
+            status: paid ? "running" : "approved",
+            reviewStatus: "approved",
+            adminNote: note,
+            reviewedBy: adminUid,
+            reviewedAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+        notificationType = paid ? "ad_started" : "ad_approved";
+        notificationText = paid
+          ? "تم تشغيل إعلانك مرة أخرى وبدأ بالظهور."
+          : "تمت إعادة إعلانك للموافقة، وبانتظار تأكيد الدفع.";
+      } else if (action === "approve_ad_payment") {
+        const reviewStatus = cleanText(adData.reviewStatus).toLowerCase();
+        const currentStatus = cleanText(adData.status).toLowerCase();
+        const shouldStart =
+          reviewStatus === "approved" &&
+          ["approved", "pending_review"].includes(currentStatus);
+        const days = boundedInt(adData.requestedDurationDays, 7, 1, 90);
+        const start = admin.firestore.Timestamp.now();
+        const end = admin.firestore.Timestamp.fromMillis(
+          start.toMillis() + days * 24 * 60 * 60 * 1000,
+        );
+        await adRef.set(
+          {
+            paymentStatus: "paid",
+            paidAmount: boundedInt(payload.paidAmount, 0, 0, 100000000),
+            paymentAdminNote: note,
+            paymentReviewedBy: adminUid,
+            paymentReviewedAt: now,
+            paidAt: now,
+            ...(shouldStart
+              ? { status: "running", startsAt: start, endsAt: end }
+              : {}),
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+        notificationType = shouldStart ? "ad_started" : "ad_payment_approved";
+        notificationText = shouldStart
+          ? "تم تأكيد الدفع وبدأ إعلانك بالظهور الآن."
+          : "تم تأكيد الدفع، وسيبدأ الإعلان بعد موافقة الإدارة.";
+      } else if (action === "reject_ad_payment") {
+        if (!note) {
+          return res.status(400).json({
+            ok: false,
+            error: "Payment rejection reason is required",
+          });
+        }
+        await adRef.set(
+          {
+            paymentStatus: "rejected_payment",
+            paymentAdminNote: note,
+            paymentReviewedBy: adminUid,
+            paymentReviewedAt: now,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+        notificationType = "ad_payment_rejected";
+        notificationText = `تم رفض وصل الدفع. السبب: ${note}`;
+      }
+
+      await notifyAdOwner(
+        adId,
+        adminUid,
+        notificationType,
+        notificationText,
+      );
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "Unsupported admin action",
+      });
+    }
+
+    await writeAdminLog(adminUid, action, payload, result);
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("admin action error", action, error);
+    return res.status(500).json({
+      ok: false,
+      error: error.message || "Server error",
+    });
+  }
+});
+
 app.get("/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
   try {
     const now = admin.firestore.Timestamp.now();
