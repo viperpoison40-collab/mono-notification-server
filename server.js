@@ -2,13 +2,44 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const admin = require("firebase-admin");
 const fs = require("fs");
-const { createHmac, randomBytes } = require("crypto");
+const { createHmac, randomBytes, randomUUID } = require("crypto");
 
 const app = express();
 
-app.use(cors());
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(helmet());
+const allowedOrigins = new Set(
+  String(process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+      const error = new Error("Origin is not allowed");
+      error.statusCode = 403;
+      return callback(error);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type", "X-Request-ID"],
+    maxAge: 86400,
+  }),
+);
+app.use((req, res, next) => {
+  const suppliedId = String(req.headers["x-request-id"] || "").trim();
+  req.requestId = /^[A-Za-z0-9._-]{8,100}$/.test(suppliedId)
+    ? suppliedId
+    : randomUUID();
+  res.setHeader("X-Request-ID", req.requestId);
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 
 const localServiceAccountPath = "./serviceAccountKey.json";
@@ -78,6 +109,119 @@ function uniqueCleanStrings(values) {
   });
 
   return out;
+}
+
+function isSafeDocumentId(value) {
+  const text = cleanText(value);
+  return Boolean(text) && text.length <= 256 && !text.includes("/");
+}
+
+function userIsDisabled(data = {}) {
+  const status = cleanText(data.status).toLowerCase();
+  return (
+    data.banned === true ||
+    data.isBanned === true ||
+    data.deleted === true ||
+    data.isDeleted === true ||
+    ["banned", "deleted", "disabled"].includes(status)
+  );
+}
+
+async function requireActiveUser(uid, { messaging = false } = {}) {
+  const snap = await db.collection("users").doc(cleanText(uid)).get();
+  if (!snap.exists) {
+    const error = new Error("user-not-found");
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const data = snap.data() || {};
+  if (userIsDisabled(data) || (messaging && data.canMessage === false)) {
+    const error = new Error("user-disabled");
+    error.statusCode = 403;
+    throw error;
+  }
+  return data;
+}
+
+async function requireConversationParticipants(convoId, firstUid, secondUid) {
+  if (!isSafeDocumentId(convoId)) {
+    const error = new Error("invalid-conversation");
+    error.statusCode = 400;
+    throw error;
+  }
+  const snap = await db.collection("conversations").doc(convoId).get();
+  const participants = snap.exists
+    ? uniqueCleanStrings(snap.data()?.participants || [])
+    : [];
+  if (
+    !snap.exists ||
+    !participants.includes(firstUid) ||
+    !participants.includes(secondUid)
+  ) {
+    const error = new Error("conversation-permission-denied");
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+async function enforceUserRateLimit(uid, action, limit, windowSeconds) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const windowId = Math.floor(nowSeconds / windowSeconds);
+  const key = `${cleanText(uid)}_${cleanText(action)}_${windowId}`.replace(
+    /[^A-Za-z0-9_-]/g,
+    "_",
+  );
+  const ref = db.collection("_serverRateLimits").doc(key);
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const count = snap.exists ? Number(snap.data()?.count || 0) : 0;
+    if (count >= limit) {
+      const error = new Error("rate-limit-exceeded");
+      error.statusCode = 429;
+      error.retryAfter = windowSeconds - (nowSeconds % windowSeconds);
+      throw error;
+    }
+    tx.set(
+      ref,
+      {
+        uid: cleanText(uid),
+        action: cleanText(action),
+        count: count + 1,
+        expiresAt: admin.firestore.Timestamp.fromMillis(
+          (nowSeconds + windowSeconds * 2) * 1000,
+        ),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  });
+}
+
+function secureAction(action, limit, windowSeconds = 60) {
+  return async (req, res, next) => {
+    try {
+      await requireActiveUser(req.user.uid, { messaging: true });
+      await enforceUserRateLimit(
+        req.user.uid,
+        action,
+        limit,
+        windowSeconds,
+      );
+      return next();
+    } catch (error) {
+      if (error.retryAfter) res.setHeader("Retry-After", error.retryAfter);
+      return res.status(error.statusCode || 403).json({
+        ok: false,
+        error:
+          error.message === "rate-limit-exceeded"
+            ? "Too many requests"
+            : "Account is not allowed to perform this action",
+        requestId: req.requestId,
+      });
+    }
+  };
 }
 
 async function verifyUser(req, res, next) {
@@ -693,6 +837,41 @@ function imageKitFileIdsFromStory(storyData = {}) {
   ]);
 }
 
+async function userOwnsImageKitFile(uid, fileId) {
+  const cleanUid = cleanText(uid);
+  const cleanFileId = cleanText(fileId);
+  const candidates = [
+    ["posts", "mediaFileId"],
+    ["posts", "thumbnailFileId"],
+    ["posts", "imageKitFileId"],
+    ["posts", "imageKitThumbnailFileId"],
+    ["posts", "mediaImageKitFileId"],
+    ["posts", "thumbnailImageKitFileId"],
+    ["stories", "mediaFileId"],
+    ["stories", "thumbnailFileId"],
+    ["stories", "imageKitFileId"],
+    ["stories", "mediaImageKitFileId"],
+    ["stories", "thumbnailImageKitFileId"],
+  ];
+
+  for (const [collection, field] of candidates) {
+    const snap = await db
+      .collection(collection)
+      .where(field, "==", cleanFileId)
+      .limit(3)
+      .get();
+    if (
+      snap.docs.some((doc) => {
+        const data = doc.data() || {};
+        return cleanText(data.userId || data.uid || data.ownerUid) === cleanUid;
+      })
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function deleteImageKitFile(fileId) {
   const cleanFileId = cleanText(fileId);
   const privateKey = cleanText(process.env.IMAGEKIT_PRIVATE_KEY);
@@ -1287,13 +1466,15 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/debug/imagekit", verifyUser, verifyAdmin, async (req, res) => {
+  if (process.env.VERCEL || process.env.NODE_ENV === "production") {
+    return res.status(404).json({ ok: false, error: "Not found" });
+  }
   const privateKey = getImageKitPrivateKey();
 
   return res.json({
     ok: true,
     hasPrivateKey: Boolean(privateKey),
     privateKeyLooksValid: privateKey.startsWith("private_"),
-    privateKeyPreview: maskSecret(privateKey),
     env: {
       IMAGEKIT_PRIVATE_KEY: Boolean(process.env.IMAGEKIT_PRIVATE_KEY),
       IMAGEKIT_PRIVATE_API_KEY: Boolean(process.env.IMAGEKIT_PRIVATE_API_KEY),
@@ -1328,7 +1509,11 @@ function maskSecret(value) {
   return `${text.substring(0, 8)}...${text.substring(text.length - 4)}`;
 }
 
-app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
+app.get(
+  "/imagekit-upload-auth",
+  verifyUser,
+  secureAction("imagekit_auth", 20, 3600),
+  async (req, res) => {
   try {
     const privateKey = getImageKitPrivateKey();
 
@@ -1382,11 +1567,17 @@ app.get("/imagekit-upload-auth", verifyUser, async (req, res) => {
     return res.status(500).json({
       ok: false,
       code: "imagekit_upload_auth_failed",
-      error: error.message || "Server error",
+      error: "Server error",
+      requestId: req.requestId,
     });
   }
-});
-app.post("/send-message", verifyUser, async (req, res) => {
+},
+);
+app.post(
+  "/send-message",
+  verifyUser,
+  secureAction("send_message", 120),
+  async (req, res) => {
   try {
     const senderUid = req.user.uid;
     const toUid = cleanText(req.body.toUid);
@@ -1407,6 +1598,9 @@ app.post("/send-message", verifyUser, async (req, res) => {
         error: "Cannot send notification to yourself",
       });
     }
+
+    await requireActiveUser(toUid, { messaging: true });
+    await requireConversationParticipants(convoId, senderUid, toUid);
 
     const senderName = await getUserTitle(senderUid);
 
@@ -1430,14 +1624,21 @@ app.post("/send-message", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-message error", error);
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       ok: false,
-      error: "Server error",
+      error:
+        error.statusCode === 403 ? "Conversation permission denied" : "Server error",
+      requestId: req.requestId,
     });
   }
-});
+},
+);
 
-app.post("/send-call", verifyUser, async (req, res) => {
+app.post(
+  "/send-call",
+  verifyUser,
+  secureAction("send_call", 10, 60),
+  async (req, res) => {
   try {
     const callerUid = req.user.uid;
     const receiverUid = cleanText(req.body.receiverUid);
@@ -1459,6 +1660,30 @@ app.post("/send-call", verifyUser, async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Cannot call yourself",
+      });
+    }
+
+    await requireActiveUser(receiverUid, { messaging: true });
+    if (conversationId) {
+      await requireConversationParticipants(
+        conversationId,
+        callerUid,
+        receiverUid,
+      );
+    }
+    if (!isSafeDocumentId(callId)) {
+      return res.status(400).json({ ok: false, error: "Invalid callId" });
+    }
+    const callSnap = await db.collection("calls").doc(callId).get();
+    const callData = callSnap.data() || {};
+    if (
+      !callSnap.exists ||
+      cleanText(callData.callerUid) !== callerUid ||
+      cleanText(callData.receiverUid) !== receiverUid
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "Call permission denied",
       });
     }
 
@@ -1501,14 +1726,20 @@ app.post("/send-call", verifyUser, async (req, res) => {
     return res.json(result);
   } catch (error) {
     console.error("send-call error", error);
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       ok: false,
       error: "Server error",
+      requestId: req.requestId,
     });
   }
-});
+},
+);
 
-app.post("/send-notification", verifyUser, async (req, res) => {
+app.post(
+  "/send-notification",
+  verifyUser,
+  secureAction("send_notification", 60),
+  async (req, res) => {
   try {
     const fromUid = req.user.uid;
     const toUid = cleanText(req.body.toUid);
@@ -1529,6 +1760,41 @@ app.post("/send-notification", verifyUser, async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Cannot send notification to yourself",
+      });
+    }
+
+    const supportedTypes = new Set(["like", "comment", "comment_like", "follow"]);
+    if (!supportedTypes.has(notificationType)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Unsupported notification type",
+      });
+    }
+
+    await requireActiveUser(toUid);
+    if (!isSafeDocumentId(notificationId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "A valid notificationId is required",
+      });
+    }
+    const notificationSnap = await db
+      .collection("users")
+      .doc(toUid)
+      .collection("notifications")
+      .doc(notificationId)
+      .get();
+    const notificationData = notificationSnap.data() || {};
+    if (
+      !notificationSnap.exists ||
+      cleanText(notificationData.fromUid) !== fromUid ||
+      cleanText(notificationData.type).toLowerCase() !== notificationType ||
+      (postId && cleanText(notificationData.postId) !== postId) ||
+      (commentId && cleanText(notificationData.commentId) !== commentId)
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "Notification permission denied",
       });
     }
 
@@ -1594,9 +1860,11 @@ app.post("/send-notification", verifyUser, async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Server error",
+      requestId: req.requestId,
     });
   }
-});
+},
+);
 
 app.post("/toggle-like", verifyUser, async (req, res) => {
   try {
@@ -2917,14 +3185,28 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
   }
 });
 
-app.post("/delete-imagekit-file", verifyUser, async (req, res) => {
+app.post(
+  "/delete-imagekit-file",
+  verifyUser,
+  secureAction("delete_imagekit_file", 20, 3600),
+  async (req, res) => {
   try {
+    const actorUid = req.user.uid;
     const fileId = cleanText(req.body.fileId);
 
-    if (!fileId) {
+    if (!isSafeDocumentId(fileId)) {
       return res.status(400).json({
         ok: false,
-        error: "fileId is required",
+        error: "A valid fileId is required",
+      });
+    }
+
+    const ownsFile = await userOwnsImageKitFile(actorUid, fileId);
+    const adminUser = await isAdminUser(req.user.uid, req.user.email);
+    if (!ownsFile && !adminUser) {
+      return res.status(403).json({
+        ok: false,
+        error: "File ownership could not be verified",
       });
     }
 
@@ -2940,9 +3222,11 @@ app.post("/delete-imagekit-file", verifyUser, async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Server error",
+      requestId: req.requestId,
     });
   }
-});
+},
+);
 
 app.post("/delete-post", verifyUser, async (req, res) => {
   try {
@@ -3033,6 +3317,32 @@ app.post("/delete-post", verifyUser, async (req, res) => {
       error: "Server error",
     });
   }
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+
+  const status = Number(error.statusCode || error.status || 500);
+  const safeStatus = status >= 400 && status < 600 ? status : 500;
+  console.error("request failed", {
+    requestId: req.requestId,
+    method: req.method,
+    path: req.path,
+    status: safeStatus,
+    code: cleanText(error.code),
+    message: shortText(error.message, 160),
+  });
+
+  return res.status(safeStatus).json({
+    ok: false,
+    error:
+      safeStatus === 403
+        ? "Request is not allowed"
+        : safeStatus === 413
+          ? "Request body is too large"
+          : "Server error",
+    requestId: req.requestId,
+  });
 });
 
 const port = process.env.PORT || 3000;
