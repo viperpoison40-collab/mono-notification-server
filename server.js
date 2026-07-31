@@ -3,7 +3,14 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-const admin = require("firebase-admin");
+const { cert, initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const {
+  FieldValue,
+  Timestamp,
+  getFirestore,
+} = require("firebase-admin/firestore");
+const { getMessaging } = require("firebase-admin/messaging");
 const fs = require("fs");
 const { createHmac, randomBytes, randomUUID } = require("crypto");
 
@@ -71,11 +78,11 @@ if (!serviceAccount) {
   throw new Error("Firebase Admin credentials are not configured.");
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+initializeApp({
+  credential: cert(serviceAccount),
 });
 
-const db = admin.firestore();
+const db = getFirestore();
 
 function cleanText(value) {
   return String(value ?? "").trim();
@@ -189,10 +196,10 @@ async function enforceUserRateLimit(uid, action, limit, windowSeconds) {
         uid: cleanText(uid),
         action: cleanText(action),
         count: count + 1,
-        expiresAt: admin.firestore.Timestamp.fromMillis(
+        expiresAt: Timestamp.fromMillis(
           (nowSeconds + windowSeconds * 2) * 1000,
         ),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
@@ -238,7 +245,7 @@ async function verifyUser(req, res, next) {
       });
     }
 
-    const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = await getAuth().verifyIdToken(token);
     req.user = decoded;
     return next();
   } catch (_) {
@@ -539,7 +546,7 @@ async function sendPushToUser({
 
   const cleanData = safeData({ ...data, title, body });
 
-  const response = await admin.messaging().sendEachForMulticast({
+  const response = await getMessaging().sendEachForMulticast({
     tokens,
     notification: { title, body },
     data: cleanData,
@@ -595,7 +602,7 @@ async function sendDataOnlyPushToUser({
     };
   }
 
-  const response = await admin.messaging().sendEachForMulticast({
+  const response = await getMessaging().sendEachForMulticast({
     tokens,
     data: safeData(data),
     android: {
@@ -678,7 +685,7 @@ async function addNotificationDoc({
       postId: cleanPostId || null,
       commentId: cleanCommentId || null,
       text: cleanText(text),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
       seen: false,
     },
     { merge: true },
@@ -1200,12 +1207,12 @@ async function deleteUserReactionsEverywhere(uid) {
 
       if (parentCollection === "posts") {
         batch.update(likedParentRef, {
-          likesCount: admin.firestore.FieldValue.increment(-1),
+          likesCount: FieldValue.increment(-1),
         });
         deletedPostLikes += 1;
       } else if (parentCollection === "comments") {
         batch.update(likedParentRef, {
-          likesCount: admin.firestore.FieldValue.increment(-1),
+          likesCount: FieldValue.increment(-1),
         });
         deletedCommentLikes += 1;
       }
@@ -1246,7 +1253,7 @@ async function deleteUserReactionsEverywhere(uid) {
 
       if (postRef) {
         batch.update(postRef, {
-          commentsCount: admin.firestore.FieldValue.increment(-1),
+          commentsCount: FieldValue.increment(-1),
         });
       }
 
@@ -1902,7 +1909,7 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
       } else {
         tx.set(likeRef, {
           uid: actorUid,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
         });
         likesCount += 1;
         liked = true;
@@ -2011,7 +2018,7 @@ app.post("/add-comment", verifyUser, async (req, res) => {
         username: actor.username || "user",
         userAvatarUrl: actor.avatarUrl || "",
         text,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
         likesCount: 0,
       });
 
@@ -2190,7 +2197,7 @@ app.post("/toggle-comment-like", verifyUser, async (req, res) => {
       } else {
         tx.set(likeRef, {
           uid: actorUid,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
         });
         likesCount += 1;
         liked = true;
@@ -2307,12 +2314,12 @@ app.post("/toggle-follow", verifyUser, async (req, res) => {
       } else {
         tx.set(followerRef, {
           uid: meUid,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
         });
 
         tx.set(followingRef, {
           uid: otherUid,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
         });
 
         followersCount += 1;
@@ -2413,7 +2420,7 @@ async function writeAdminLog(adminUid, action, payload = {}, result = {}) {
     ),
     reason: cleanText(payload.reason || payload.adminNote || payload.note),
     result,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdAt: FieldValue.serverTimestamp(),
   });
 }
 
@@ -2509,7 +2516,7 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
   const adminUid = req.user.uid;
   const payload = req.body || {};
   const action = cleanText(payload.action).toLowerCase();
-  const now = admin.firestore.FieldValue.serverTimestamp();
+  const now = FieldValue.serverTimestamp();
 
   try {
     let result = {};
@@ -2562,8 +2569,8 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
             bannedBy: adminUid,
             bannedAt: now,
             updatedAt: now,
-            lastFcmToken: admin.firestore.FieldValue.delete(),
-            lastFcmTokenUpdatedAt: admin.firestore.FieldValue.delete(),
+            lastFcmToken: FieldValue.delete(),
+            lastFcmTokenUpdatedAt: FieldValue.delete(),
           },
           { merge: true },
         );
@@ -2574,7 +2581,7 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
             banned: false,
             isBanned: false,
             canMessage: true,
-            banReason: admin.firestore.FieldValue.delete(),
+            banReason: FieldValue.delete(),
             unbannedBy: adminUid,
             unbannedAt: now,
             updatedAt: now,
@@ -2601,8 +2608,8 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
             deleteReason: cleanText(payload.reason),
             deletedAt: now,
             updatedAt: now,
-            lastFcmToken: admin.firestore.FieldValue.delete(),
-            lastFcmTokenUpdatedAt: admin.firestore.FieldValue.delete(),
+            lastFcmToken: FieldValue.delete(),
+            lastFcmTokenUpdatedAt: FieldValue.delete(),
           },
           { merge: true },
         );
@@ -2840,8 +2847,8 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
       if (action === "approve_ad") {
         const paid = cleanText(adData.paymentStatus).toLowerCase() === "paid";
         const days = boundedInt(adData.requestedDurationDays, 7, 1, 90);
-        const start = admin.firestore.Timestamp.now();
-        const end = admin.firestore.Timestamp.fromMillis(
+        const start = Timestamp.now();
+        const end = Timestamp.fromMillis(
           start.toMillis() + days * 24 * 60 * 60 * 1000,
         );
         await adRef.set(
@@ -2924,8 +2931,8 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
           reviewStatus === "approved" &&
           ["approved", "pending_review"].includes(currentStatus);
         const days = boundedInt(adData.requestedDurationDays, 7, 1, 90);
-        const start = admin.firestore.Timestamp.now();
-        const end = admin.firestore.Timestamp.fromMillis(
+        const start = Timestamp.now();
+        const end = Timestamp.fromMillis(
           start.toMillis() + days * 24 * 60 * 60 * 1000,
         );
         await adRef.set(
@@ -2994,7 +3001,7 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
 
 app.get("/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
   try {
-    const now = admin.firestore.Timestamp.now();
+    const now = Timestamp.now();
 
     const countResults = await Promise.all([
       safeCount("usersTotal", db.collection("users")),
@@ -3102,7 +3109,7 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
       adminUid,
       targetUid,
       reason,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     await targetUserRef
@@ -3113,7 +3120,7 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
           deleted: true,
           isDeleted: true,
           canMessage: false,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         },
         { merge: true },
       )
@@ -3139,7 +3146,7 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
     let authDeleteSkipped = false;
 
     try {
-      await admin.auth().deleteUser(targetUid);
+      await getAuth().deleteUser(targetUid);
       authDeleted = true;
     } catch (error) {
       if (error.code === "auth/user-not-found") {
@@ -3171,7 +3178,7 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
       targetUid,
       reason,
       result,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     return res.json(result);
@@ -3269,7 +3276,7 @@ app.post("/delete-post", verifyUser, async (req, res) => {
     batch.delete(postRef);
 
     batch.update(db.collection("users").doc(ownerUid), {
-      postsCount: admin.firestore.FieldValue.increment(-1),
+      postsCount: FieldValue.increment(-1),
     });
 
     await batch.commit();

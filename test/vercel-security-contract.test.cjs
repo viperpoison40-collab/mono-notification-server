@@ -8,6 +8,13 @@ const source = fs.readFileSync(
   "utf8",
 );
 
+test("Firebase Admin uses the supported modular API", () => {
+  assert.match(source, /require\("firebase-admin\/app"\)/);
+  assert.match(source, /require\("firebase-admin\/firestore"\)/);
+  assert.match(source, /credential: cert\(serviceAccount\)/);
+  assert.doesNotMatch(source, /admin\.credential/);
+});
+
 test("API applies security headers and an explicit CORS allowlist", () => {
   assert.match(source, /app\.use\(helmet\(\)\)/);
   assert.match(source, /process\.env\.ALLOWED_ORIGINS/);
