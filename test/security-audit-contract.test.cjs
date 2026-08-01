@@ -45,7 +45,7 @@ test("important authorization events are persisted", () => {
 });
 
 test("dependency updates remain on Vercel-compatible major versions", () => {
-  assert.equal(packageJson.dependencies["firebase-admin"], "14.2.0");
+  assert.equal(packageJson.dependencies["firebase-admin"], "13.10.0");
   assert.equal(packageJson.overrides.uuid, "11.1.1");
   assert.match(packageJson.dependencies.express, /^\^4\./);
   assert.match(packageJson.dependencies.dotenv, /^\^16\./);
