@@ -172,6 +172,29 @@ async function requireConversationParticipants(convoId, firstUid, secondUid) {
   }
 }
 
+async function requireNoBlockBetween(firstUid, secondUid) {
+  const first = cleanText(firstUid);
+  const second = cleanText(secondUid);
+  if (!first || !second || first === second) {
+    const error = new Error("invalid-block-check");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const refs = [
+    db.collection("users").doc(first).collection("blocked").doc(second),
+    db.collection("users").doc(second).collection("blocked").doc(first),
+    db.collection("users").doc(first).collection("blockedUsers").doc(second),
+    db.collection("users").doc(second).collection("blockedUsers").doc(first),
+  ];
+  const snapshots = await db.getAll(...refs);
+  if (snapshots.some((snap) => snap.exists)) {
+    const error = new Error("users-blocked");
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
 async function enforceUserRateLimit(uid, action, limit, windowSeconds) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const windowId = Math.floor(nowSeconds / windowSeconds);
@@ -716,6 +739,13 @@ async function sendInteractionPush({
 
   if (!cleanToUid || !cleanType || !cleanFromUid) return null;
   if (cleanToUid === cleanFromUid) return null;
+
+  try {
+    await requireNoBlockBetween(cleanFromUid, cleanToUid);
+  } catch (error) {
+    if (error.message === "users-blocked") return null;
+    throw error;
+  }
 
   const fromName = await getUserTitle(cleanFromUid);
 
@@ -1915,7 +1945,6 @@ app.post(
     const toUid = cleanText(req.body.toUid);
     const convoId = cleanText(req.body.convoId);
     const messageId = cleanText(req.body.messageId);
-    const text = cleanText(req.body.text);
 
     if (!toUid || !convoId) {
       return res.status(400).json({
@@ -1933,13 +1962,38 @@ app.post(
 
     await requireActiveUser(toUid, { messaging: true });
     await requireConversationParticipants(convoId, senderUid, toUid);
+    await requireNoBlockBetween(senderUid, toUid);
+    if (!isSafeDocumentId(messageId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "A valid messageId is required",
+      });
+    }
+    const messageSnap = await db
+      .collection("conversations")
+      .doc(convoId)
+      .collection("messages")
+      .doc(messageId)
+      .get();
+    const messageData = messageSnap.data() || {};
+    if (
+      !messageSnap.exists ||
+      cleanText(messageData.fromUid) !== senderUid ||
+      cleanText(messageData.toUid) !== toUid
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "Message permission denied",
+      });
+    }
+    const verifiedText = cleanText(messageData.text);
 
     const senderName = await getUserTitle(senderUid);
 
     const result = await sendPushToUser({
       uid: toUid,
       title: senderName,
-      body: shortText(text, 100) || "أرسل لك رسالة جديدة",
+      body: shortText(verifiedText, 100) || "أرسل لك رسالة جديدة",
       collapseKey: `chat_${convoId}`,
       tag: `chat_${convoId}`,
       data: {
@@ -1981,10 +2035,10 @@ app.post(
 
     const callType = cleanText(req.body.callType) === "video" ? "video" : "voice";
 
-    if (!receiverUid || !callId) {
+    if (!receiverUid || !callId || !conversationId) {
       return res.status(400).json({
         ok: false,
-        error: "receiverUid and callId are required",
+        error: "receiverUid, callId and conversationId are required",
       });
     }
 
@@ -1996,13 +2050,12 @@ app.post(
     }
 
     await requireActiveUser(receiverUid, { messaging: true });
-    if (conversationId) {
-      await requireConversationParticipants(
-        conversationId,
-        callerUid,
-        receiverUid,
-      );
-    }
+    await requireNoBlockBetween(callerUid, receiverUid);
+    await requireConversationParticipants(
+      conversationId,
+      callerUid,
+      receiverUid,
+    );
     if (!isSafeDocumentId(callId)) {
       return res.status(400).json({ ok: false, error: "Invalid callId" });
     }
@@ -2011,7 +2064,10 @@ app.post(
     if (
       !callSnap.exists ||
       cleanText(callData.callerUid) !== callerUid ||
-      cleanText(callData.receiverUid) !== receiverUid
+      cleanText(callData.receiverUid) !== receiverUid ||
+      cleanText(callData.status).toLowerCase() !== "ringing" ||
+      cleanText(callData.type).toLowerCase() !== callType ||
+      cleanText(callData.conversationId) !== conversationId
     ) {
       return res.status(403).json({
         ok: false,
@@ -2104,6 +2160,7 @@ app.post(
     }
 
     await requireActiveUser(toUid);
+    await requireNoBlockBetween(fromUid, toUid);
     if (!isSafeDocumentId(notificationId)) {
       return res.status(400).json({
         ok: false,
@@ -2189,9 +2246,9 @@ app.post(
     return res.json(result);
   } catch (error) {
     console.error("send-notification error", error);
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       ok: false,
-      error: "Server error",
+      error: error.statusCode === 403 ? "Notification permission denied" : "Server error",
       requestId: req.requestId,
     });
   }

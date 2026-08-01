@@ -54,8 +54,22 @@ test("ad metrics are validated and written only by the backend", () => {
 
 test("message and call pushes verify server-side resources", () => {
   assert.match(source, /requireConversationParticipants/);
+  assert.match(source, /requireNoBlockBetween\(senderUid, toUid\)/);
+  assert.match(source, /A valid messageId is required/);
+  assert.match(source, /cleanText\(messageData\.fromUid\) !== senderUid/);
   assert.match(source, /db\.collection\("calls"\)\.doc\(callId\)\.get\(\)/);
   assert.match(source, /cleanText\(callData\.callerUid\) !== callerUid/);
+  assert.match(source, /requireNoBlockBetween\(callerUid, receiverUid\)/);
+  assert.match(source, /cleanText\(callData\.status\)\.toLowerCase\(\) !== "ringing"/);
+});
+
+test("blocking is enforced for messages calls and notifications", () => {
+  assert.match(source, /async function requireNoBlockBetween/);
+  assert.match(source, /collection\("blocked"\)\.doc\(second\)/);
+  assert.match(source, /collection\("blockedUsers"\)\.doc\(second\)/);
+  assert.match(source, /snapshots\.some\(\(snap\) => snap\.exists\)/);
+  assert.match(source, /requireNoBlockBetween\(fromUid, toUid\)/);
+  assert.match(source, /await requireNoBlockBetween\(cleanFromUid, cleanToUid\)/);
 });
 
 test("generic notifications require an existing matching notification", () => {
