@@ -865,6 +865,22 @@ function trendScore(likesCount, commentsCount) {
   return Number(likesCount || 0) + Number(commentsCount || 0) * 2;
 }
 
+function engagementScore(data = {}, overrides = {}) {
+  const value = (key) => Math.max(
+    0,
+    Number(Object.prototype.hasOwnProperty.call(overrides, key)
+      ? overrides[key]
+      : data[key] || 0),
+  );
+  return Number((
+    value("likesCount") +
+    value("commentsCount") * 2 +
+    value("savesCount") * 3 +
+    value("sharesCount") * 4 +
+    value("viewsCount") * 0.2
+  ).toFixed(2));
+}
+
 function likeNotificationId(postId, actorUid) {
   return `like_${cleanText(postId)}_${cleanText(actorUid)}`;
 }
@@ -899,6 +915,13 @@ async function addNotificationDoc({
 
   if (!cleanToUid || !cleanType || !cleanFromUid) return;
   if (cleanToUid === cleanFromUid) return;
+
+  try {
+    await requireNoBlockBetween(cleanFromUid, cleanToUid);
+  } catch (error) {
+    if (error.message === "users-blocked") return;
+    throw error;
+  }
 
   const allowed = await isNotificationTypeEnabled(cleanToUid, cleanType);
   if (!allowed) return;
@@ -2468,6 +2491,409 @@ const AD_EVENT_PLACEMENTS = new Set([
   "explore",
 ]);
 
+function cleanAdPlacement(value) {
+  const placement = cleanText(value).toLowerCase();
+  return AD_EVENT_PLACEMENTS.has(placement) ? placement : "home_feed";
+}
+
+function cleanAdMediaType(value) {
+  return cleanText(value).toLowerCase() === "video" ? "video" : "image";
+}
+
+function cleanAdDestinationType(value) {
+  const type = cleanText(value).toLowerCase();
+  return ["profile", "message", "call", "external_url", "none"].includes(type)
+    ? type
+    : "profile";
+}
+
+function cleanAdGender(value) {
+  const gender = cleanText(value).toLowerCase();
+  return ["male", "female", "all"].includes(gender) ? gender : "all";
+}
+
+function cleanAdInterests(value) {
+  if (!Array.isArray(value)) return [];
+  return uniqueCleanStrings(value)
+    .map((item) => item.toLowerCase().replace(/[^\p{L}\p{N}_-]/gu, ""))
+    .filter((item) => item.length >= 2 && item.length <= 40)
+    .slice(0, 12);
+}
+
+function assertOwnedAdAssetData({
+  asset,
+  ownerUid,
+  fileId,
+  filePath,
+  url,
+  mediaType,
+  purpose,
+  adId = "",
+}) {
+  const expectedRoot = `/ads/${ownerUid}/`;
+  const expectedProofRoot = `/ads/${ownerUid}/payments/`;
+  const actualPath = cleanText(asset.filePath);
+  const boundAdId = cleanText(asset.boundAdId);
+  const expectedType = purpose === "payment_proof" ? "image" : mediaType;
+
+  const pathAllowed = purpose === "payment_proof"
+    ? actualPath.startsWith(expectedProofRoot)
+    : actualPath.startsWith(expectedRoot) &&
+      !actualPath.startsWith(expectedProofRoot);
+
+  if (
+    cleanText(asset.fileId) !== fileId ||
+    cleanText(asset.ownerUid) !== ownerUid ||
+    cleanText(asset.status).toLowerCase() !== "active" ||
+    cleanText(asset.type).toLowerCase() !== expectedType ||
+    actualPath !== filePath ||
+    cleanText(asset.url) !== url ||
+    !pathAllowed ||
+    (boundAdId && boundAdId !== adId)
+  ) {
+    const error = new Error("ad-media-ownership-invalid");
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+async function requireOwnedAdAsset({
+  ownerUid,
+  fileId,
+  filePath,
+  url,
+  mediaType,
+  purpose,
+  adId = "",
+}) {
+  if (
+    !isSafeDocumentId(fileId) ||
+    !filePath.startsWith("/") ||
+    !url.startsWith("https://")
+  ) {
+    const error = new Error("ad-media-identifiers-required");
+    error.statusCode = 400;
+    throw error;
+  }
+  const ref = db.collection("_mediaAssets").doc(fileId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    const error = new Error("ad-media-not-registered");
+    error.statusCode = 403;
+    throw error;
+  }
+  assertOwnedAdAssetData({
+    asset: snap.data() || {},
+    ownerUid,
+    fileId,
+    filePath,
+    url,
+    mediaType,
+    purpose,
+    adId,
+  });
+  return ref;
+}
+
+async function verifyAdMediaOwnership(adId, adData) {
+  const ownerUid = cleanText(adData.ownerUid);
+  await requireOwnedAdAsset({
+    ownerUid,
+    fileId: cleanText(adData.mediaFileId),
+    filePath: cleanText(adData.mediaFilePath),
+    url: cleanText(adData.mediaUrl),
+    mediaType: cleanAdMediaType(adData.mediaType),
+    purpose: "ad_media",
+    adId,
+  });
+
+  if (cleanText(adData.paymentProofUrl)) {
+    await requireOwnedAdAsset({
+      ownerUid,
+      fileId: cleanText(adData.paymentProofFileId),
+      filePath: cleanText(adData.paymentProofFilePath),
+      url: cleanText(adData.paymentProofUrl),
+      mediaType: "image",
+      purpose: "payment_proof",
+      adId,
+    });
+  }
+}
+
+app.post(
+  "/ads/create",
+  verifyUser,
+  secureAction("ad_create", 8, 3600, { messaging: false }),
+  async (req, res) => {
+    try {
+      const ownerUid = req.user.uid;
+      const title = cleanText(req.body.title);
+      const description = cleanText(req.body.description);
+      const mediaType = cleanAdMediaType(req.body.mediaType);
+      const mediaUrl = cleanText(req.body.mediaUrl);
+      const mediaFileId = cleanText(req.body.mediaFileId);
+      const mediaFilePath = cleanText(req.body.mediaFilePath);
+      const proofUrl = cleanText(req.body.paymentProofUrl);
+      const proofFileId = cleanText(req.body.paymentProofFileId);
+      const proofFilePath = cleanText(req.body.paymentProofFilePath);
+
+      if (
+        title.length < 3 ||
+        title.length > 90 ||
+        description.length < 3 ||
+        description.length > 280
+      ) {
+        return res.status(400).json({ ok: false, error: "Invalid ad content" });
+      }
+
+      const mediaRef = await requireOwnedAdAsset({
+        ownerUid,
+        fileId: mediaFileId,
+        filePath: mediaFilePath,
+        url: mediaUrl,
+        mediaType,
+        purpose: "ad_media",
+      });
+      const proofRef = proofUrl
+        ? await requireOwnedAdAsset({
+            ownerUid,
+            fileId: proofFileId,
+            filePath: proofFilePath,
+            url: proofUrl,
+            mediaType: "image",
+            purpose: "payment_proof",
+          })
+        : null;
+
+      const owner = await getPublicUserData(ownerUid);
+      const adRef = db.collection("ads").doc();
+      const paymentStatus = proofUrl ? "payment_pending" : "unpaid";
+      const now = FieldValue.serverTimestamp();
+
+      await db.runTransaction(async (tx) => {
+        const assetSnaps = await Promise.all([
+          tx.get(mediaRef),
+          ...(proofRef ? [tx.get(proofRef)] : []),
+        ]);
+        assertOwnedAdAssetData({
+          asset: assetSnaps[0].data() || {},
+          ownerUid,
+          fileId: mediaFileId,
+          filePath: mediaFilePath,
+          url: mediaUrl,
+          mediaType,
+          purpose: "ad_media",
+        });
+        if (proofRef) {
+          assertOwnedAdAssetData({
+            asset: assetSnaps[1].data() || {},
+            ownerUid,
+            fileId: proofFileId,
+            filePath: proofFilePath,
+            url: proofUrl,
+            mediaType: "image",
+            purpose: "payment_proof",
+          });
+        }
+
+        tx.create(adRef, {
+          adId: adRef.id,
+          ownerUid,
+          ownerName: owner.username || "Advertiser",
+          ownerAvatarUrl: owner.avatarUrl || "",
+          businessName: shortText(req.body.businessName, 120),
+          title,
+          titleLower: title.toLowerCase(),
+          description,
+          descriptionLower: description.toLowerCase(),
+          mediaType,
+          mediaUrl,
+          mediaFileId,
+          mediaFilePath,
+          placement: cleanAdPlacement(req.body.placement),
+          destinationType: cleanAdDestinationType(req.body.destinationType),
+          destinationValue: shortText(req.body.destinationValue, 500),
+          status: "pending_review",
+          reviewStatus: "pending",
+          adminNote: "",
+          reviewedBy: "",
+          totalImpressions: 0,
+          totalClicks: 0,
+          maxImpressions: boundedInt(req.body.maxImpressions, 1000, 100, 1000000),
+          maxClicks: boundedInt(req.body.maxClicks, 0, 0, 1000000),
+          requestedDurationDays: boundedInt(
+            req.body.requestedDurationDays,
+            7,
+            1,
+            90,
+          ),
+          packageId: shortText(req.body.packageId, 120),
+          packageName: shortText(req.body.packageName, 160),
+          packageDescription: shortText(req.body.packageDescription, 500),
+          targetCountry: shortText(req.body.targetCountry, 80).toLowerCase(),
+          targetCity: shortText(req.body.targetCity, 80).toLowerCase(),
+          targetGender: cleanAdGender(req.body.targetGender),
+          targetInterests: cleanAdInterests(req.body.targetInterests),
+          targetingVersion: 1,
+          requestedAmount: boundedInt(req.body.requestedAmount, 0, 0, 100000000),
+          paidAmount: 0,
+          currency: cleanCurrency(req.body.currency),
+          paymentMethod: cleanPaymentAccountType(req.body.paymentMethod),
+          paymentAccountId: shortText(req.body.paymentAccountId, 120),
+          paymentAccountName: shortText(req.body.paymentAccountName, 160),
+          paymentAccountNumber: shortText(req.body.paymentAccountNumber, 120),
+          paymentAccountHolderName: shortText(
+            req.body.paymentAccountHolderName,
+            160,
+          ),
+          paymentInstructions: shortText(req.body.paymentInstructions, 1000),
+          paymentReference: shortText(req.body.paymentReference, 160),
+          payerName: shortText(req.body.payerName, 160),
+          paymentStatus,
+          paymentAdminNote: "",
+          paymentReviewedBy: "",
+          paymentProofUrl: proofUrl,
+          paymentProofFileId: proofFileId,
+          paymentProofFilePath: proofFilePath,
+          paymentProofUploadedAt: proofUrl ? now : null,
+          paymentReviewedAt: null,
+          paidAt: null,
+          budget: 0,
+          dailyBudget: 0,
+          createdAt: now,
+          updatedAt: now,
+          reviewedAt: null,
+          approvedAt: null,
+          rejectedAt: null,
+          startsAt: null,
+          endsAt: null,
+          completedAt: null,
+          completionReason: "",
+        });
+        tx.update(mediaRef, {
+          boundAdId: adRef.id,
+          purpose: "ad_media",
+          boundAt: now,
+        });
+        if (proofRef) {
+          tx.update(proofRef, {
+            boundAdId: adRef.id,
+            purpose: "payment_proof",
+            boundAt: now,
+          });
+        }
+      });
+
+      await addNotificationDoc({
+        toUid: ownerUid,
+        type: "ad_submitted",
+        fromUid: ownerUid,
+        text: "تم استلام إعلانك وهو الآن قيد المراجعة.",
+        notificationId: `ad_submitted_${adRef.id}`,
+      });
+      return res.json({ ok: true, adId: adRef.id });
+    } catch (error) {
+      console.error("ads-create error", { requestId: req.requestId, error: error.message });
+      return res.status(error.statusCode || 500).json({
+        ok: false,
+        error: error.statusCode ? error.message : "Server error",
+        requestId: req.requestId,
+      });
+    }
+  },
+);
+
+app.post(
+  "/ads/payment-proof",
+  verifyUser,
+  secureAction("ad_payment_proof", 12, 3600, { messaging: false }),
+  async (req, res) => {
+    try {
+      const ownerUid = req.user.uid;
+      const adId = cleanText(req.body.adId);
+      const proofUrl = cleanText(req.body.paymentProofUrl);
+      const proofFileId = cleanText(req.body.paymentProofFileId);
+      const proofFilePath = cleanText(req.body.paymentProofFilePath);
+      if (!isSafeDocumentId(adId)) {
+        return res.status(400).json({ ok: false, error: "Invalid adId" });
+      }
+
+      const adRef = db.collection("ads").doc(adId);
+      const proofRef = await requireOwnedAdAsset({
+        ownerUid,
+        fileId: proofFileId,
+        filePath: proofFilePath,
+        url: proofUrl,
+        mediaType: "image",
+        purpose: "payment_proof",
+        adId,
+      });
+
+      await db.runTransaction(async (tx) => {
+        const [adSnap, proofSnap] = await Promise.all([
+          tx.get(adRef),
+          tx.get(proofRef),
+        ]);
+        if (!adSnap.exists || cleanText(adSnap.data()?.ownerUid) !== ownerUid) {
+          const error = new Error("ad-owner-required");
+          error.statusCode = 403;
+          throw error;
+        }
+        assertOwnedAdAssetData({
+          asset: proofSnap.data() || {},
+          ownerUid,
+          fileId: proofFileId,
+          filePath: proofFilePath,
+          url: proofUrl,
+          mediaType: "image",
+          purpose: "payment_proof",
+          adId,
+        });
+        tx.set(
+          adRef,
+          {
+            paymentStatus: "payment_pending",
+            paymentProofUrl: proofUrl,
+            paymentProofFileId: proofFileId,
+            paymentProofFilePath: proofFilePath,
+            paymentProofUploadedAt: FieldValue.serverTimestamp(),
+            paymentMethod: cleanPaymentAccountType(req.body.paymentMethod),
+            paymentReference: shortText(req.body.paymentReference, 160),
+            payerName: shortText(req.body.payerName, 160),
+            requestedAmount: boundedInt(
+              req.body.requestedAmount,
+              0,
+              0,
+              100000000,
+            ),
+            currency: cleanCurrency(req.body.currency),
+            paymentAdminNote: "",
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+        tx.update(proofRef, {
+          boundAdId: adId,
+          purpose: "payment_proof",
+          boundAt: FieldValue.serverTimestamp(),
+        });
+      });
+
+      return res.json({ ok: true, adId, paymentStatus: "payment_pending" });
+    } catch (error) {
+      console.error("ads-payment-proof error", {
+        requestId: req.requestId,
+        error: error.message,
+      });
+      return res.status(error.statusCode || 500).json({
+        ok: false,
+        error: error.statusCode ? error.message : "Server error",
+        requestId: req.requestId,
+      });
+    }
+  },
+);
+
 function timestampMillis(value) {
   if (value && typeof value.toMillis === "function") return value.toMillis();
   return 0;
@@ -2636,12 +3062,16 @@ app.post(
   },
 );
 
-app.post("/toggle-like", verifyUser, async (req, res) => {
+app.post(
+  "/toggle-like",
+  verifyUser,
+  secureAction("toggle_like", 120, 3600, { messaging: false }),
+  async (req, res) => {
   try {
     const actorUid = req.user.uid;
     const postId = cleanText(req.body.postId);
 
-    if (!postId) {
+    if (!isSafeDocumentId(postId)) {
       return res.status(400).json({
         ok: false,
         error: "postId is required",
@@ -2681,6 +3111,8 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
       tx.update(postRef, {
         likesCount,
         trendScore: trendScore(likesCount, commentsCount),
+        engagementScore: engagementScore(postData, { likesCount }),
+        trendScoreUpdatedAt: FieldValue.serverTimestamp(),
       });
 
       return {
@@ -2732,16 +3164,19 @@ app.post("/toggle-like", verifyUser, async (req, res) => {
       error: notFound ? "Post not found" : "Server error",
     });
   }
-});
+  },
+);
 
-app.post("/add-comment", verifyUser, async (req, res) => {
+app.post(
+  "/add-comment",
+  verifyUser,
+  secureAction("add_comment", 80, 3600),
+  async (req, res) => {
   try {
     const actorUid = req.user.uid;
     const postId = cleanText(req.body.postId);
     const text = cleanText(req.body.text);
-    const actorUsernameFallback = cleanText(req.body.actorUsername);
-
-    if (!postId || !text) {
+    if (!isSafeDocumentId(postId) || !text) {
       return res.status(400).json({
         ok: false,
         error: "postId and text are required",
@@ -2756,11 +3191,9 @@ app.post("/add-comment", verifyUser, async (req, res) => {
     }
 
     const actor = await getPublicUserData(actorUid).catch(() => ({
-      username: actorUsernameFallback || "user",
+      username: "user",
       avatarUrl: "",
     }));
-
-    if (actorUsernameFallback) actor.username = actorUsernameFallback;
 
     const postRef = db.collection("posts").doc(postId);
     const commentRef = postRef.collection("comments").doc();
@@ -2788,6 +3221,8 @@ app.post("/add-comment", verifyUser, async (req, res) => {
       tx.update(postRef, {
         commentsCount,
         trendScore: trendScore(likesCount, commentsCount),
+        engagementScore: engagementScore(postData, { commentsCount }),
+        trendScoreUpdatedAt: FieldValue.serverTimestamp(),
       });
 
       return {
@@ -2836,15 +3271,20 @@ app.post("/add-comment", verifyUser, async (req, res) => {
       error: notFound ? "Post not found" : "Server error",
     });
   }
-});
+  },
+);
 
-app.post("/delete-comment", verifyUser, async (req, res) => {
+app.post(
+  "/delete-comment",
+  verifyUser,
+  secureAction("delete_comment", 100, 3600, { messaging: false }),
+  async (req, res) => {
   try {
     const actorUid = req.user.uid;
     const postId = cleanText(req.body.postId);
     const commentId = cleanText(req.body.commentId);
 
-    if (!postId || !commentId) {
+    if (!isSafeDocumentId(postId) || !isSafeDocumentId(commentId)) {
       return res.status(400).json({
         ok: false,
         error: "postId and commentId are required",
@@ -2885,6 +3325,8 @@ app.post("/delete-comment", verifyUser, async (req, res) => {
       tx.update(postRef, {
         commentsCount,
         trendScore: trendScore(likesCount, commentsCount),
+        engagementScore: engagementScore(postData, { commentsCount }),
+        trendScoreUpdatedAt: FieldValue.serverTimestamp(),
       });
 
       return {
@@ -2917,15 +3359,20 @@ app.post("/delete-comment", verifyUser, async (req, res) => {
       error: denied ? "Permission denied" : "Server error",
     });
   }
-});
+  },
+);
 
-app.post("/toggle-comment-like", verifyUser, async (req, res) => {
+app.post(
+  "/toggle-comment-like",
+  verifyUser,
+  secureAction("toggle_comment_like", 160, 3600, { messaging: false }),
+  async (req, res) => {
   try {
     const actorUid = req.user.uid;
     const postId = cleanText(req.body.postId);
     const commentId = cleanText(req.body.commentId);
 
-    if (!postId || !commentId) {
+    if (!isSafeDocumentId(postId) || !isSafeDocumentId(commentId)) {
       return res.status(400).json({
         ok: false,
         error: "postId and commentId are required",
@@ -3024,7 +3471,140 @@ app.post("/toggle-comment-like", verifyUser, async (req, res) => {
       error: notFound ? "Comment not found" : "Server error",
     });
   }
-});
+  },
+);
+
+app.post(
+  "/posts/toggle-save",
+  verifyUser,
+  secureAction("toggle_save", 120, 3600, { messaging: false }),
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
+      const postId = cleanText(req.body.postId);
+      if (!isSafeDocumentId(postId)) {
+        return res.status(400).json({ ok: false, error: "Invalid postId" });
+      }
+
+      const postRef = db.collection("posts").doc(postId);
+      const savedRef = db
+        .collection("users")
+        .doc(uid)
+        .collection("savedPosts")
+        .doc(postId);
+      const result = await db.runTransaction(async (tx) => {
+        const [postSnap, savedSnap] = await Promise.all([
+          tx.get(postRef),
+          tx.get(savedRef),
+        ]);
+        if (!postSnap.exists) {
+          const error = new Error("post-not-found");
+          error.statusCode = 404;
+          throw error;
+        }
+        const post = postSnap.data() || {};
+        let savesCount = Math.max(0, Number(post.savesCount || 0));
+        let saved;
+        if (savedSnap.exists) {
+          tx.delete(savedRef);
+          savesCount = Math.max(0, savesCount - 1);
+          saved = false;
+        } else {
+          tx.create(savedRef, {
+            postId,
+            ownerUid: cleanText(post.userId),
+            type: cleanText(post.type),
+            mediaUrl: cleanText(post.mediaUrl),
+            thumbnailUrl: cleanText(post.thumbnailUrl),
+            caption: cleanText(post.caption),
+            username: cleanText(post.username),
+            userAvatarUrl: cleanText(post.userAvatarUrl),
+            savedAt: FieldValue.serverTimestamp(),
+          });
+          savesCount += 1;
+          saved = true;
+        }
+        tx.update(postRef, {
+          savesCount,
+          engagementScore: engagementScore(post, { savesCount }),
+          engagementScoreUpdatedAt: FieldValue.serverTimestamp(),
+        });
+        return { saved, savesCount };
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      console.error("toggle-save error", error);
+      return res.status(error.statusCode || 500).json({
+        ok: false,
+        error: error.statusCode ? error.message : "Server error",
+        requestId: req.requestId,
+      });
+    }
+  },
+);
+
+app.post(
+  "/posts/share",
+  verifyUser,
+  secureAction("post_share", 80, 3600, { messaging: false }),
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
+      const postId = cleanText(req.body.postId);
+      if (!isSafeDocumentId(postId)) {
+        return res.status(400).json({ ok: false, error: "Invalid postId" });
+      }
+      const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+      const postRef = db.collection("posts").doc(postId);
+      const shareRef = postRef.collection("shares").doc(`${uid}_${day}`);
+      const result = await db.runTransaction(async (tx) => {
+        const [postSnap, shareSnap] = await Promise.all([
+          tx.get(postRef),
+          tx.get(shareRef),
+        ]);
+        if (!postSnap.exists) {
+          const error = new Error("post-not-found");
+          error.statusCode = 404;
+          throw error;
+        }
+        const post = postSnap.data() || {};
+        const current = Math.max(
+          0,
+          Number(post.sharesCount || 0),
+        );
+        if (shareSnap.exists) {
+          return { recorded: false, duplicate: true, sharesCount: current };
+        }
+        tx.create(shareRef, {
+          uid,
+          postId,
+          day,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        tx.update(postRef, {
+          sharesCount: current + 1,
+          engagementScore: engagementScore(post, {
+            sharesCount: current + 1,
+          }),
+          engagementScoreUpdatedAt: FieldValue.serverTimestamp(),
+        });
+        return {
+          recorded: true,
+          duplicate: false,
+          sharesCount: current + 1,
+        };
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      console.error("post-share error", error);
+      return res.status(error.statusCode || 500).json({
+        ok: false,
+        error: error.statusCode ? error.message : "Server error",
+        requestId: req.requestId,
+      });
+    }
+  },
+);
 
 app.post("/toggle-follow", verifyUser, async (req, res) => {
   try {
@@ -3163,10 +3743,11 @@ function cleanPaymentAccountType(value) {
     "fastpay",
     "bank_transfer",
     "cash",
+    "manual",
     "other",
   ]);
   const type = cleanText(value).toLowerCase();
-  return allowed.has(type) ? type : "zain_cash";
+  return allowed.has(type) ? type : "manual";
 }
 
 async function writeAdminLog(adminUid, action, payload = {}, result = {}) {
@@ -3629,6 +4210,7 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
       let notificationText = "";
 
       if (action === "approve_ad") {
+        await verifyAdMediaOwnership(adId, adData);
         const paid = cleanText(adData.paymentStatus).toLowerCase() === "paid";
         const days = boundedInt(adData.requestedDurationDays, 7, 1, 90);
         const start = Timestamp.now();
@@ -3692,6 +4274,7 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
         notificationType = "ad_paused";
         notificationText = "تم إيقاف إعلانك مؤقتًا من الإدارة.";
       } else if (action === "resume_ad") {
+        await verifyAdMediaOwnership(adId, adData);
         const paid = cleanText(adData.paymentStatus).toLowerCase() === "paid";
         await adRef.set(
           {
@@ -3709,6 +4292,7 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
           ? "تم تشغيل إعلانك مرة أخرى وبدأ بالظهور."
           : "تمت إعادة إعلانك للموافقة، وبانتظار تأكيد الدفع.";
       } else if (action === "approve_ad_payment") {
+        await verifyAdMediaOwnership(adId, adData);
         const reviewStatus = cleanText(adData.reviewStatus).toLowerCase();
         const currentStatus = cleanText(adData.status).toLowerCase();
         const shouldStart =
