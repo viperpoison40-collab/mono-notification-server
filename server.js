@@ -5,6 +5,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const { cert, initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
+const { getAppCheck } = require("firebase-admin/app-check");
 const {
   FieldPath,
   FieldValue,
@@ -35,7 +36,12 @@ app.use(
       return callback(error);
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Authorization", "Content-Type", "X-Request-ID"],
+    allowedHeaders: [
+      "Authorization",
+      "Content-Type",
+      "X-Request-ID",
+      "X-Firebase-AppCheck",
+    ],
     maxAge: 86400,
   }),
 );
@@ -462,6 +468,73 @@ function secureAction(
   };
 }
 
+function appCheckEnforcementMode() {
+  const mode = cleanText(process.env.APP_CHECK_ENFORCEMENT).toLowerCase();
+  if (mode === "off" || mode === "enforce") return mode;
+  return "monitor";
+}
+
+function logAppCheckMonitorFailure(req, reason) {
+  console.warn("app-check monitor", {
+    requestId: req.requestId,
+    method: req.method,
+    path: req.path,
+    reason,
+  });
+}
+
+async function verifyAppCheckRequest(req) {
+  const mode = appCheckEnforcementMode();
+  req.appCheck = {
+    mode,
+    valid: false,
+    appId: "",
+    reason: mode === "off" ? "disabled" : "missing",
+  };
+
+  if (mode === "off") {
+    return { allowed: true, valid: false, reason: "disabled" };
+  }
+
+  const token = cleanText(req.headers["x-firebase-appcheck"]);
+  if (!token) {
+    if (mode === "monitor") logAppCheckMonitorFailure(req, "missing");
+    return {
+      allowed: mode !== "enforce",
+      valid: false,
+      reason: "missing",
+    };
+  }
+
+  try {
+    const decoded = await getAppCheck().verifyToken(token);
+    const appId = cleanText(decoded.appId);
+    req.appCheck = {
+      mode,
+      valid: true,
+      appId,
+      reason: "valid",
+    };
+    if (mode === "monitor") {
+      console.info("app-check verified", {
+        requestId: req.requestId,
+        method: req.method,
+        path: req.path,
+        appId,
+      });
+    }
+    return { allowed: true, valid: true, appId, reason: "valid" };
+  } catch (_) {
+    req.appCheck.reason = "invalid";
+    if (mode === "monitor") logAppCheckMonitorFailure(req, "invalid");
+    return {
+      allowed: mode !== "enforce",
+      valid: false,
+      reason: "invalid",
+    };
+  }
+}
+
 async function verifyUser(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -477,6 +550,14 @@ async function verifyUser(req, res, next) {
     }
 
     const decoded = await getAuth().verifyIdToken(token);
+    const appCheckResult = await verifyAppCheckRequest(req);
+    if (!appCheckResult.allowed) {
+      return res.status(401).json({
+        ok: false,
+        error: "Invalid Firebase App Check token",
+        requestId: req.requestId,
+      });
+    }
     req.user = decoded;
     await migrateLegacyPrivateUserData(decoded.uid).catch((error) => {
       console.warn("User privacy migration failed", decoded.uid, error.message);
