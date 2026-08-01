@@ -9,10 +9,13 @@
     "test": "node --test test/*.test.cjs"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "firebase-admin": "13.10.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "firebase-admin": "14.2.0",
     "helmet": "^8.3.0"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
   }
 }

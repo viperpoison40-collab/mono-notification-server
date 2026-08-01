@@ -35,5 +35,5 @@ test("migration moves preferences and tokens before public cleanup", () => {
 });
 
 test("every migration batch is included in the existing admin audit log", () => {
-  assert.match(source, /writeAdminLog\(adminUid, action, payload, result\)/);
+  assert.match(source, /writeAdminLog\(req, adminUid, action, payload, result\)/);
 });

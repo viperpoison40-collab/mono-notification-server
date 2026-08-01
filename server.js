@@ -91,6 +91,8 @@ initializeApp({
 
 const db = getFirestore();
 const privacyMigrationChecked = new Set();
+const SECURITY_AUDIT_COLLECTION = "_securityAuditLogs";
+const SECURITY_AUDIT_VERSION = 1;
 
 function cleanText(value) {
   return String(value ?? "").trim();
@@ -100,6 +102,118 @@ function shortText(value, max = 120) {
   const text = cleanText(value);
   if (!text) return "";
   return text.length > max ? `${text.substring(0, max)}...` : text;
+}
+
+function safeAuditMetadata(data = {}) {
+  const output = {};
+  const forbidden = /token|secret|password|authorization|cookie|body|email/i;
+
+  Object.entries(data || {})
+    .slice(0, 20)
+    .forEach(([rawKey, rawValue]) => {
+      const key = cleanText(rawKey).replace(/[^A-Za-z0-9_.-]/g, "_");
+      if (!key || forbidden.test(key)) return;
+
+      if (typeof rawValue === "boolean") {
+        output[key] = rawValue;
+      } else if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+        output[key] = rawValue;
+      } else if (rawValue !== null && rawValue !== undefined) {
+        const value = shortText(rawValue, 240);
+        if (value) output[key] = value;
+      }
+    });
+
+  return output;
+}
+
+function securityAuditIpHash(req) {
+  const key = cleanText(process.env.SECURITY_AUDIT_HMAC_KEY);
+  const ip = cleanText(req?.ip || req?.socket?.remoteAddress);
+  if (!key || !ip) return "";
+  return createHmac("sha256", key).update(ip).digest("hex");
+}
+
+function securityAuditSignature(event) {
+  const key = cleanText(process.env.SECURITY_AUDIT_HMAC_KEY);
+  if (!key) return "";
+
+  const signedPayload = JSON.stringify({
+    version: event.version,
+    eventId: event.eventId,
+    eventType: event.eventType,
+    category: event.category,
+    severity: event.severity,
+    outcome: event.outcome,
+    actorUid: event.actorUid,
+    targetUid: event.targetUid,
+    requestId: event.requestId,
+    method: event.method,
+    path: event.path,
+    appId: event.appId,
+    occurredAtMs: event.occurredAtMs,
+    metadata: event.metadata,
+  });
+
+  return createHmac("sha256", key).update(signedPayload).digest("hex");
+}
+
+async function writeSecurityAuditEvent(
+  req,
+  {
+    eventType,
+    category = "security",
+    severity = "medium",
+    outcome = "observed",
+    actorUid = "",
+    targetUid = "",
+    metadata = {},
+  },
+) {
+  const eventId = randomUUID();
+  const occurredAtMs = Date.now();
+  const event = {
+    version: SECURITY_AUDIT_VERSION,
+    eventId,
+    eventType: shortText(eventType, 100),
+    category: shortText(category, 60),
+    severity: shortText(severity, 20),
+    outcome: shortText(outcome, 30),
+    actorUid: cleanText(actorUid || req?.user?.uid),
+    targetUid: cleanText(targetUid),
+    requestId: cleanText(req?.requestId),
+    method: shortText(req?.method, 12),
+    path: shortText(req?.path, 180),
+    appId: cleanText(req?.appCheck?.appId),
+    appCheckValid: req?.appCheck?.valid === true,
+    ipHash: securityAuditIpHash(req),
+    occurredAtMs,
+    metadata: safeAuditMetadata(metadata),
+  };
+  const integrityHash = securityAuditSignature(event);
+
+  await db.collection(SECURITY_AUDIT_COLLECTION).doc(eventId).create({
+    ...event,
+    integrity: integrityHash ? "hmac-sha256" : "unsigned",
+    integrityHash,
+    occurredAt: Timestamp.fromMillis(occurredAtMs),
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  return eventId;
+}
+
+async function recordSecurityAuditEvent(req, event) {
+  try {
+    return await writeSecurityAuditEvent(req, event);
+  } catch (error) {
+    console.error("security audit write failed", {
+      requestId: req?.requestId,
+      eventType: shortText(event?.eventType, 100),
+      message: shortText(error.message, 160),
+    });
+    return "";
+  }
 }
 
 function safeData(data = {}) {
@@ -456,6 +570,19 @@ function secureAction(
       return next();
     } catch (error) {
       if (error.retryAfter) res.setHeader("Retry-After", error.retryAfter);
+      await recordSecurityAuditEvent(req, {
+        eventType:
+          error.message === "rate-limit-exceeded"
+            ? "rate_limit.exceeded"
+            : "authorization.user_action_denied",
+        category:
+          error.message === "rate-limit-exceeded"
+            ? "rate_limit"
+            : "authorization",
+        severity: error.message === "rate-limit-exceeded" ? "medium" : "high",
+        outcome: "denied",
+        metadata: { action, retryAfter: error.retryAfter || 0 },
+      });
       return res.status(error.statusCode || 403).json({
         ok: false,
         error:
@@ -550,15 +677,22 @@ async function verifyUser(req, res, next) {
     }
 
     const decoded = await getAuth().verifyIdToken(token);
+    req.user = decoded;
     const appCheckResult = await verifyAppCheckRequest(req);
     if (!appCheckResult.allowed) {
+      await recordSecurityAuditEvent(req, {
+        eventType: "app_check.request_denied",
+        category: "app_check",
+        severity: "high",
+        outcome: "denied",
+        metadata: { reason: appCheckResult.reason },
+      });
       return res.status(401).json({
         ok: false,
         error: "Invalid Firebase App Check token",
         requestId: req.requestId,
       });
     }
-    req.user = decoded;
     await migrateLegacyPrivateUserData(decoded.uid).catch((error) => {
       console.warn("User privacy migration failed", decoded.uid, error.message);
     });
@@ -611,6 +745,12 @@ async function verifyAdmin(req, res, next) {
   try {
     const ok = await isAdminUser(req.user?.uid, req.user?.email);
     if (!ok) {
+      await recordSecurityAuditEvent(req, {
+        eventType: "authorization.admin_denied",
+        category: "authorization",
+        severity: "high",
+        outcome: "denied",
+      });
       return res.status(403).json({
         ok: false,
         error: "Admin permission required",
@@ -1810,6 +1950,39 @@ async function getRecentAdminLogs(limit = 8) {
     });
   } catch (error) {
     console.warn("Failed to read admin logs", error.message);
+    return [];
+  }
+}
+
+async function getRecentSecurityAuditEvents(limit = 12) {
+  try {
+    const snap = await db
+      .collection(SECURITY_AUDIT_COLLECTION)
+      .orderBy("occurredAt", "desc")
+      .limit(Math.max(1, Math.min(50, Number(limit) || 12)))
+      .get();
+
+    return snap.docs.map((doc) => {
+      const data = doc.data() || {};
+      return {
+        id: doc.id,
+        eventType: cleanText(data.eventType),
+        category: cleanText(data.category),
+        severity: cleanText(data.severity),
+        outcome: cleanText(data.outcome),
+        actorUid: cleanText(data.actorUid),
+        targetUid: cleanText(data.targetUid),
+        requestId: cleanText(data.requestId),
+        path: cleanText(data.path),
+        appId: cleanText(data.appId),
+        appCheckValid: data.appCheckValid === true,
+        integrity: cleanText(data.integrity),
+        metadata: safeAuditMetadata(data.metadata),
+        occurredAt: timestampToIso(data.occurredAt),
+      };
+    });
+  } catch (error) {
+    console.warn("Failed to read security audit events", error.message);
     return [];
   }
 }
@@ -3831,7 +4004,7 @@ function cleanPaymentAccountType(value) {
   return allowed.has(type) ? type : "manual";
 }
 
-async function writeAdminLog(adminUid, action, payload = {}, result = {}) {
+async function writeAdminLog(req, adminUid, action, payload = {}, result = {}) {
   await db.collection("adminLogs").add({
     action,
     adminUid,
@@ -3846,6 +4019,24 @@ async function writeAdminLog(adminUid, action, payload = {}, result = {}) {
     reason: cleanText(payload.reason || payload.adminNote || payload.note),
     result,
     createdAt: FieldValue.serverTimestamp(),
+  });
+
+  await recordSecurityAuditEvent(req, {
+    eventType: `admin.${cleanText(action).toLowerCase()}`,
+    category: "admin",
+    severity: "high",
+    outcome: "success",
+    actorUid: adminUid,
+    targetUid: cleanText(payload.targetUid),
+    metadata: {
+      targetId: cleanText(
+        payload.postId ||
+          payload.reportId ||
+          payload.adId ||
+          payload.packageId ||
+          payload.accountId,
+      ),
+    },
   });
 }
 
@@ -4437,9 +4628,18 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
       });
     }
 
-    await writeAdminLog(adminUid, action, payload, result);
+    await writeAdminLog(req, adminUid, action, payload, result);
     return res.json({ ok: true, ...result });
   } catch (error) {
+    await recordSecurityAuditEvent(req, {
+      eventType: `admin.${action || "unknown"}`,
+      category: "admin",
+      severity: "high",
+      outcome: "failed",
+      actorUid: adminUid,
+      targetUid: cleanText(payload.targetUid),
+      metadata: { errorCode: cleanText(error.code) || "admin-action-failed" },
+    });
     console.error("admin action error", action, error);
     return res.status(500).json({
       ok: false,
@@ -4484,6 +4684,10 @@ app.get("/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
       safeCount("messagesTotal", db.collectionGroup("messages")),
       safeCount("callsTotal", db.collection("calls")),
       safeCount("adminLogsTotal", db.collection("adminLogs")),
+      safeCount(
+        "securityAuditLogsTotal",
+        db.collection(SECURITY_AUDIT_COLLECTION),
+      ),
     ]);
 
     const counts = {};
@@ -4494,8 +4698,9 @@ app.get("/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
       if (item.error) countErrors[item.label] = item.error;
     });
 
-    const [recentAdminLogs, media] = await Promise.all([
+    const [recentAdminLogs, recentSecurityAuditEvents, media] = await Promise.all([
       getRecentAdminLogs(8),
+      getRecentSecurityAuditEvents(12),
       buildMediaSummary().catch((error) => ({
         error: error.message || "media-summary-failed",
       })),
@@ -4508,6 +4713,7 @@ app.get("/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
       countErrors,
       media,
       recentAdminLogs,
+      recentSecurityAuditEvents,
       limitsNote:
         "This endpoint counts app data in Firestore. Firebase/Vercel/ImageKit plan limits must still be checked from each provider dashboard.",
     });
@@ -4559,6 +4765,14 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
       targetUid,
       reason,
       createdAt: FieldValue.serverTimestamp(),
+    });
+    await recordSecurityAuditEvent(req, {
+      eventType: "admin.delete_user_completely_started",
+      category: "admin",
+      severity: "critical",
+      outcome: "started",
+      actorUid: adminUid,
+      targetUid,
     });
 
     await targetUserRef
@@ -4629,9 +4843,27 @@ app.post("/admin/delete-user-completely", verifyUser, verifyAdmin, async (req, r
       result,
       createdAt: FieldValue.serverTimestamp(),
     });
+    await recordSecurityAuditEvent(req, {
+      eventType: "admin.delete_user_completely_finished",
+      category: "admin",
+      severity: "critical",
+      outcome: "success",
+      actorUid: adminUid,
+      targetUid,
+      metadata: { durationMs: result.durationMs, authDeleted },
+    });
 
     return res.json(result);
   } catch (error) {
+    await recordSecurityAuditEvent(req, {
+      eventType: "admin.delete_user_completely",
+      category: "admin",
+      severity: "critical",
+      outcome: "failed",
+      actorUid: req.user?.uid,
+      targetUid: cleanText(req.body?.targetUid || req.body?.uid),
+      metadata: { errorCode: cleanText(error.code) || "delete-user-failed" },
+    });
     console.error("admin delete-user-completely error", error);
 
     return res.status(500).json({
@@ -4783,7 +5015,7 @@ app.post("/delete-post", verifyUser, async (req, res) => {
   }
 });
 
-app.use((error, req, res, next) => {
+app.use(async (error, req, res, next) => {
   if (res.headersSent) return next(error);
 
   const status = Number(error.statusCode || error.status || 500);
@@ -4796,6 +5028,16 @@ app.use((error, req, res, next) => {
     code: cleanText(error.code),
     message: shortText(error.message, 160),
   });
+
+  if (safeStatus >= 500) {
+    await recordSecurityAuditEvent(req, {
+      eventType: "server.request_failed",
+      category: "availability",
+      severity: "high",
+      outcome: "failed",
+      metadata: { status: safeStatus, errorCode: cleanText(error.code) },
+    });
+  }
 
   return res.status(safeStatus).json({
     ok: false,

@@ -48,7 +48,7 @@ test("private user data is migrated away from public profiles", () => {
   assert.match(source, /FieldPath\.documentId\(\)/);
   assert.match(source, /dryRun: payload\.dryRun !== false/);
   assert.match(source, /limit: payload\.limit/);
-  assert.match(source, /writeAdminLog\(adminUid, action, payload, result\)/);
+  assert.match(source, /writeAdminLog\(req, adminUid, action, payload, result\)/);
 });
 
 test("ad metrics are validated and written only by the backend", () => {

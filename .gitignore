@@ -4,3 +4,6 @@ node_modules
 serviceAccountKey.json
 *.zip
 patch_backups/
+
+.vercel
+.env*
