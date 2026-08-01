@@ -35,6 +35,17 @@ test("sensitive user actions have authenticated rate limits", () => {
   }
 });
 
+test("private user data is migrated away from public profiles", () => {
+  assert.match(source, /LEGACY_PRIVATE_USER_FIELDS/);
+  assert.match(source, /migrateLegacyPrivateUserData\(decoded\.uid\)/);
+  assert.match(source, /collection\("private"\)\.doc\("profile"\)/);
+  assert.doesNotMatch(
+    source,
+    /\["usernameLower",\s*"displayNameLower",\s*"emailLower"\]/,
+  );
+  assert.match(source, /getAuth\(\)\.getUserByEmail\(cleanQuery\)/);
+});
+
 test("ad metrics are validated and written only by the backend", () => {
   const routeStart = source.indexOf('app.post(\n  "/ads/event"');
   const routeEnd = source.indexOf('app.post("/toggle-like"', routeStart);

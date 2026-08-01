@@ -83,6 +83,7 @@ initializeApp({
 });
 
 const db = getFirestore();
+const privacyMigrationChecked = new Set();
 
 function cleanText(value) {
   return String(value ?? "").trim();
@@ -116,6 +117,107 @@ function uniqueCleanStrings(values) {
   });
 
   return out;
+}
+
+const LEGACY_PRIVATE_USER_FIELDS = [
+  "email",
+  "emailLower",
+  "phone",
+  "phoneNumber",
+  "fcmToken",
+  "pushToken",
+  "notificationToken",
+  "apnsToken",
+  "lastFcmToken",
+  "lastFcmTokenUpdatedAt",
+  "deviceToken",
+  "deviceTokens",
+  "country",
+  "city",
+  "gender",
+  "adInterests",
+];
+
+async function migrateLegacyPrivateUserData(uid) {
+  const cleanUid = cleanText(uid);
+  if (!cleanUid || privacyMigrationChecked.has(cleanUid)) return;
+
+  const userRef = db.collection("users").doc(cleanUid);
+  const snap = await userRef.get();
+  if (!snap.exists) {
+    privacyMigrationChecked.add(cleanUid);
+    return;
+  }
+
+  const data = snap.data() || {};
+  const existingFields = LEGACY_PRIVATE_USER_FIELDS.filter((field) =>
+    Object.prototype.hasOwnProperty.call(data, field),
+  );
+  if (existingFields.length === 0) {
+    privacyMigrationChecked.add(cleanUid);
+    return;
+  }
+
+  const batch = db.batch();
+  const privateProfile = {};
+  if (Object.prototype.hasOwnProperty.call(data, "country")) {
+    privateProfile.country = shortText(data.country, 80).toLowerCase();
+  }
+  if (Object.prototype.hasOwnProperty.call(data, "city")) {
+    privateProfile.city = shortText(data.city, 80).toLowerCase();
+  }
+  if (Object.prototype.hasOwnProperty.call(data, "gender")) {
+    const gender = cleanText(data.gender).toLowerCase();
+    privateProfile.gender = ["male", "female"].includes(gender)
+      ? gender
+      : "all";
+  }
+  if (Array.isArray(data.adInterests)) {
+    privateProfile.adInterests = uniqueCleanStrings(data.adInterests)
+      .slice(0, 12);
+  }
+  if (Object.keys(privateProfile).length > 0) {
+    batch.set(
+      userRef.collection("private").doc("profile"),
+      {
+        ...privateProfile,
+        schemaVersion: 1,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  }
+
+  const legacyToken = cleanText(
+    data.lastFcmToken ||
+      data.fcmToken ||
+      data.pushToken ||
+      data.notificationToken ||
+      data.apnsToken,
+  );
+  if (
+    legacyToken &&
+    legacyToken.length <= 4096 &&
+    !legacyToken.includes("/")
+  ) {
+    batch.set(
+      userRef.collection("fcmTokens").doc(legacyToken),
+      {
+        token: legacyToken,
+        platform: "legacy",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  }
+
+  const publicCleanup = {};
+  existingFields.forEach((field) => {
+    publicCleanup[field] = FieldValue.delete();
+  });
+  batch.update(userRef, publicCleanup);
+  await batch.commit();
+  privacyMigrationChecked.add(cleanUid);
 }
 
 function isSafeDocumentId(value) {
@@ -275,6 +377,9 @@ async function verifyUser(req, res, next) {
 
     const decoded = await getAuth().verifyIdToken(token);
     req.user = decoded;
+    await migrateLegacyPrivateUserData(decoded.uid).catch((error) => {
+      console.warn("User privacy migration failed", decoded.uid, error.message);
+    });
     return next();
   } catch (_) {
     return res.status(401).json({
@@ -3050,7 +3155,7 @@ async function searchAdminUsers(query) {
   if (exact.exists) addSnapshot({ docs: [exact] });
 
   const end = `${cleanQuery}\uf8ff`;
-  for (const field of ["usernameLower", "displayNameLower", "emailLower"]) {
+  for (const field of ["usernameLower", "displayNameLower"]) {
     try {
       addSnapshot(
         await db
@@ -3063,6 +3168,19 @@ async function searchAdminUsers(query) {
       );
     } catch (error) {
       console.warn("Admin user search field failed", field, error.message);
+    }
+  }
+
+  // Email belongs to Firebase Authentication, never to the public user doc.
+  if (cleanQuery.includes("@")) {
+    try {
+      const authUser = await getAuth().getUserByEmail(cleanQuery);
+      const userSnap = await db.collection("users").doc(authUser.uid).get();
+      if (userSnap.exists) addSnapshot({ docs: [userSnap] });
+    } catch (error) {
+      if (error.code !== "auth/user-not-found") {
+        console.warn("Admin Auth email lookup failed", error.message);
+      }
     }
   }
 
