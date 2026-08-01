@@ -36,6 +36,7 @@ test("all client admin mutations are handled by the backend", () => {
     "resume_ad",
     "approve_ad_payment",
     "reject_ad_payment",
+    "migrate_user_privacy_batch",
   ];
 
   requiredActions.forEach((action) => {

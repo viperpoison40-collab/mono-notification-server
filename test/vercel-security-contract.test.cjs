@@ -44,6 +44,11 @@ test("private user data is migrated away from public profiles", () => {
     /\["usernameLower",\s*"displayNameLower",\s*"emailLower"\]/,
   );
   assert.match(source, /getAuth\(\)\.getUserByEmail\(cleanQuery\)/);
+  assert.match(source, /runUserPrivacyMigrationBatch/);
+  assert.match(source, /FieldPath\.documentId\(\)/);
+  assert.match(source, /dryRun: payload\.dryRun !== false/);
+  assert.match(source, /limit: payload\.limit/);
+  assert.match(source, /writeAdminLog\(adminUid, action, payload, result\)/);
 });
 
 test("ad metrics are validated and written only by the backend", () => {

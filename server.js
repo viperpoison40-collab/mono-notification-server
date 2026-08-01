@@ -6,6 +6,7 @@ const helmet = require("helmet");
 const { cert, initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const {
+  FieldPath,
   FieldValue,
   Timestamp,
   getFirestore,
@@ -138,6 +139,101 @@ const LEGACY_PRIVATE_USER_FIELDS = [
   "adInterests",
 ];
 
+function legacyUserTokenCandidates(data = {}) {
+  const values = [
+    data.lastFcmToken,
+    data.fcmToken,
+    data.pushToken,
+    data.notificationToken,
+    data.apnsToken,
+    data.deviceToken,
+  ];
+
+  if (Array.isArray(data.deviceTokens)) {
+    values.push(...data.deviceTokens);
+  } else if (data.deviceTokens && typeof data.deviceTokens === "object") {
+    values.push(...Object.values(data.deviceTokens));
+  }
+
+  const unique = uniqueCleanStrings(values);
+  const valid = unique.filter(
+    (token) =>
+      token.length >= 6 && token.length <= 4096 && !token.includes("/"),
+  );
+
+  return {
+    tokens: valid.slice(0, 5),
+    invalidTokenCount:
+      unique.length - valid.length + Math.max(0, valid.length - 5),
+  };
+}
+
+function legacyPrivateProfile(data = {}) {
+  const profile = {};
+
+  if (Object.prototype.hasOwnProperty.call(data, "country")) {
+    profile.country = shortText(data.country, 80).toLowerCase();
+  }
+  if (Object.prototype.hasOwnProperty.call(data, "city")) {
+    profile.city = shortText(data.city, 80).toLowerCase();
+  }
+  if (Object.prototype.hasOwnProperty.call(data, "gender")) {
+    const gender = cleanText(data.gender).toLowerCase();
+    profile.gender = ["male", "female"].includes(gender) ? gender : "all";
+  }
+  if (Array.isArray(data.adInterests)) {
+    profile.adInterests = uniqueCleanStrings(data.adInterests).slice(0, 12);
+  }
+
+  return profile;
+}
+
+function legacyUserPrivacyPlan(data = {}) {
+  const existingFields = LEGACY_PRIVATE_USER_FIELDS.filter((field) =>
+    Object.prototype.hasOwnProperty.call(data, field),
+  );
+  const tokenResult = legacyUserTokenCandidates(data);
+
+  return {
+    existingFields,
+    privateProfile: legacyPrivateProfile(data),
+    tokens: tokenResult.tokens,
+    invalidTokenCount: tokenResult.invalidTokenCount,
+  };
+}
+
+function addUserPrivacyMigrationWrites(batch, userRef, plan) {
+  if (Object.keys(plan.privateProfile).length > 0) {
+    batch.set(
+      userRef.collection("private").doc("profile"),
+      {
+        ...plan.privateProfile,
+        schemaVersion: 1,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  }
+
+  plan.tokens.forEach((token) => {
+    batch.set(
+      userRef.collection("fcmTokens").doc(token),
+      {
+        token,
+        platform: "legacy",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  });
+
+  const publicCleanup = {};
+  plan.existingFields.forEach((field) => {
+    publicCleanup[field] = FieldValue.delete();
+  });
+  batch.update(userRef, publicCleanup);
+}
+
 async function migrateLegacyPrivateUserData(uid) {
   const cleanUid = cleanText(uid);
   if (!cleanUid || privacyMigrationChecked.has(cleanUid)) return;
@@ -149,75 +245,80 @@ async function migrateLegacyPrivateUserData(uid) {
     return;
   }
 
-  const data = snap.data() || {};
-  const existingFields = LEGACY_PRIVATE_USER_FIELDS.filter((field) =>
-    Object.prototype.hasOwnProperty.call(data, field),
-  );
-  if (existingFields.length === 0) {
+  const plan = legacyUserPrivacyPlan(snap.data() || {});
+  if (plan.existingFields.length === 0) {
     privacyMigrationChecked.add(cleanUid);
     return;
   }
 
   const batch = db.batch();
-  const privateProfile = {};
-  if (Object.prototype.hasOwnProperty.call(data, "country")) {
-    privateProfile.country = shortText(data.country, 80).toLowerCase();
-  }
-  if (Object.prototype.hasOwnProperty.call(data, "city")) {
-    privateProfile.city = shortText(data.city, 80).toLowerCase();
-  }
-  if (Object.prototype.hasOwnProperty.call(data, "gender")) {
-    const gender = cleanText(data.gender).toLowerCase();
-    privateProfile.gender = ["male", "female"].includes(gender)
-      ? gender
-      : "all";
-  }
-  if (Array.isArray(data.adInterests)) {
-    privateProfile.adInterests = uniqueCleanStrings(data.adInterests)
-      .slice(0, 12);
-  }
-  if (Object.keys(privateProfile).length > 0) {
-    batch.set(
-      userRef.collection("private").doc("profile"),
-      {
-        ...privateProfile,
-        schemaVersion: 1,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-  }
-
-  const legacyToken = cleanText(
-    data.lastFcmToken ||
-      data.fcmToken ||
-      data.pushToken ||
-      data.notificationToken ||
-      data.apnsToken,
-  );
-  if (
-    legacyToken &&
-    legacyToken.length <= 4096 &&
-    !legacyToken.includes("/")
-  ) {
-    batch.set(
-      userRef.collection("fcmTokens").doc(legacyToken),
-      {
-        token: legacyToken,
-        platform: "legacy",
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-  }
-
-  const publicCleanup = {};
-  existingFields.forEach((field) => {
-    publicCleanup[field] = FieldValue.delete();
-  });
-  batch.update(userRef, publicCleanup);
+  addUserPrivacyMigrationWrites(batch, userRef, plan);
   await batch.commit();
   privacyMigrationChecked.add(cleanUid);
+}
+
+async function runUserPrivacyMigrationBatch({
+  adminUid,
+  cursor = "",
+  dryRun = true,
+  limit = 60,
+  requestId = "",
+}) {
+  const cleanCursor = cleanText(cursor);
+  const safeLimit = boundedInt(limit, 60, 1, 60);
+
+  if (cleanCursor && !isSafeDocumentId(cleanCursor)) {
+    const error = new Error("Invalid migration cursor");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  let query = db
+    .collection("users")
+    .orderBy(FieldPath.documentId())
+    .limit(safeLimit);
+  if (cleanCursor) query = query.startAfter(cleanCursor);
+
+  const snap = await query.get();
+  const batch = dryRun ? null : db.batch();
+  let needsMigration = 0;
+  let migrated = 0;
+  let invalidTokenCount = 0;
+  const migratedIds = [];
+
+  snap.docs.forEach((userDoc) => {
+    const plan = legacyUserPrivacyPlan(userDoc.data() || {});
+    if (plan.existingFields.length === 0) return;
+
+    needsMigration += 1;
+    invalidTokenCount += plan.invalidTokenCount;
+
+    if (batch) {
+      addUserPrivacyMigrationWrites(batch, userDoc.ref, plan);
+      migrated += 1;
+      migratedIds.push(userDoc.id);
+    }
+  });
+
+  const nextCursor = snap.empty ? "" : snap.docs[snap.docs.length - 1].id;
+  const done = snap.size < safeLimit;
+
+  if (batch && migrated > 0) {
+    await batch.commit();
+    migratedIds.forEach((uid) => privacyMigrationChecked.add(uid));
+  }
+
+  return {
+    dryRun: Boolean(dryRun),
+    scanned: snap.size,
+    needsMigration,
+    migrated,
+    invalidTokenCount,
+    nextCursor,
+    done,
+    requestId: cleanText(requestId),
+    adminUid: cleanText(adminUid),
+  };
 }
 
 function isSafeDocumentId(value) {
@@ -3203,7 +3304,15 @@ app.post("/admin/action", verifyUser, verifyAdmin, async (req, res) => {
       });
     }
 
-    if (
+    if (action === "migrate_user_privacy_batch") {
+      result = await runUserPrivacyMigrationBatch({
+        adminUid,
+        cursor: payload.cursor,
+        dryRun: payload.dryRun !== false,
+        limit: payload.limit,
+        requestId: req.requestId,
+      });
+    } else if (
       [
         "ban_user",
         "unban_user",
